@@ -1,6 +1,7 @@
 use std::error::Error as ErrorTrait;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use mycode_core::config::{
     Config, HookAction, HookEvent, McpTransport, PermissionMode, ProviderProtocol,
@@ -22,6 +23,51 @@ fn write_provider_config(work: &Path, provider_yaml: &str) {
         &work.join(".mycode/config.yaml"),
         &format!("providers:\n  - {normalized_provider}\n"),
     );
+}
+
+#[test]
+fn hook_config_uses_go_compatible_field_names() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let work = tempfile::tempdir().expect("work tempdir");
+    write(
+        &work.path().join(".mycode/config.yaml"),
+        r#"
+providers:
+  - name: provider
+    protocol: anthropic
+    base_url: https://provider.example.test
+    model: model
+hooks:
+  - id: command-hook
+    event: pre_tool_use
+    if: tool == "Bash"
+    action:
+      type: command
+      command: echo hello
+      timeout: 5s
+  - id: http-hook
+    event: post_tool_use
+    action:
+      type: http
+      url: https://hook.example.test
+      timeout: 10s
+"#,
+    );
+
+    let config = Config::load(home.path(), work.path()).expect("config should load");
+
+    assert_eq!(
+        config.hooks[0].condition.as_deref(),
+        Some(r#"tool == "Bash""#)
+    );
+    assert!(matches!(
+        &config.hooks[0].action,
+        HookAction::Command { timeout, .. } if *timeout == Some(Duration::from_secs(5))
+    ));
+    assert!(matches!(
+        &config.hooks[1].action,
+        HookAction::Http { timeout, .. } if *timeout == Some(Duration::from_secs(10))
+    ));
 }
 
 #[test]
@@ -290,4 +336,29 @@ fn provider_api_key_falls_back_to_protocol_environment_variable() {
             Some("environment-key".to_string())
         );
     }
+}
+
+#[test]
+fn provider_api_key_fallback_is_loaded_from_a_config_fixture() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let work = tempfile::tempdir().expect("work tempdir");
+    write(
+        &work.path().join(".mycode/config.yaml"),
+        r#"
+providers:
+  - name: fixture-provider
+    protocol: anthropic
+    base_url: https://provider.example.test
+    model: model
+"#,
+    );
+
+    let config = Config::load(home.path(), work.path()).expect("config should load");
+    let api_key = config.providers[0]
+        .resolve_api_key_with(|variable| {
+            (variable == "ANTHROPIC_API_KEY").then(|| "environment-key".to_string())
+        })
+        .expect("environment key should resolve");
+
+    assert_eq!(api_key, "environment-key");
 }

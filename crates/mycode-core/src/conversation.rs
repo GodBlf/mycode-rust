@@ -56,6 +56,13 @@ impl ConversationMessage {
     }
 }
 
+pub(crate) fn first_user_text(messages: &[ConversationMessage]) -> Option<&str> {
+    messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(ConversationMessage::first_text)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     messages: Vec<ConversationMessage>,
@@ -72,6 +79,10 @@ impl Conversation {
 
     pub fn messages(&self) -> &[ConversationMessage] {
         &self.messages
+    }
+
+    pub fn first_user_text(&self) -> Option<&str> {
+        first_user_text(&self.messages)
     }
 
     pub fn into_messages(self) -> Vec<ConversationMessage> {

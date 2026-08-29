@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use serde::de::Error as SerdeError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -143,8 +145,8 @@ pub enum HookErrorPolicy {
 pub enum HookAction {
     Command {
         command: String,
-        #[serde(default)]
-        timeout_seconds: Option<u64>,
+        #[serde(default, deserialize_with = "deserialize_duration")]
+        timeout: Option<Duration>,
     },
     Prompt {
         message: String,
@@ -157,8 +159,8 @@ pub enum HookAction {
         headers: BTreeMap<String, String>,
         #[serde(default)]
         body: String,
-        #[serde(default)]
-        timeout_seconds: Option<u64>,
+        #[serde(default, deserialize_with = "deserialize_duration")]
+        timeout: Option<Duration>,
     },
     Agent {
         #[serde(default)]
@@ -174,6 +176,7 @@ pub struct HookConfig {
     pub id: Option<String>,
     pub event: HookEvent,
     #[serde(default)]
+    #[serde(rename = "if")]
     pub condition: Option<String>,
     pub action: HookAction,
     #[serde(default)]
@@ -309,6 +312,13 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_providers()?;
+        self.validate_mcp_servers()?;
+        self.validate_hooks()?;
+        Ok(())
+    }
+
+    fn validate_providers(&self) -> Result<(), ConfigError> {
         if self.providers.is_empty() {
             return Err(ConfigError::Validation {
                 message: "at least one provider must be configured".into(),
@@ -358,7 +368,10 @@ impl Config {
                 message: "provider names must be unique".into(),
             });
         }
+        Ok(())
+    }
 
+    fn validate_mcp_servers(&self) -> Result<(), ConfigError> {
         for (index, server) in self.mcp_servers.iter().enumerate() {
             if server.name.trim().is_empty() {
                 return Err(ConfigError::Validation {
@@ -400,7 +413,10 @@ impl Config {
                 }
             }
         }
+        Ok(())
+    }
 
+    fn validate_hooks(&self) -> Result<(), ConfigError> {
         for (index, hook) in self.hooks.iter().enumerate() {
             let label = hook
                 .id
@@ -531,6 +547,19 @@ fn parse_permission_mode(value: Option<&str>) -> Result<PermissionMode, ConfigEr
                 "invalid permission_mode {value:?}; expected default, acceptEdits, plan, or bypassPermissions"
             ),
         }),
+    }
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) => humantime::parse_duration(&value)
+            .map(Some)
+            .map_err(|error| D::Error::custom(error.to_string())),
     }
 }
 

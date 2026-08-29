@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::conversation::ConversationMessage;
+use crate::conversation::{ConversationMessage, first_user_text};
 use crate::workspace::{WorkspacePaths, unique_slug};
 
 #[derive(Debug, Error)]
@@ -211,11 +211,7 @@ impl SessionStore {
                 session_id: id.as_str().to_string(),
                 source,
             })?;
-            let first_user_message = messages
-                .iter()
-                .find(|message| message.role == crate::conversation::MessageRole::User)
-                .and_then(|message| message.first_text())
-                .map(str::to_string);
+            let first_user_message = first_user_text(&messages).map(str::to_string);
 
             let modified_at = metadata
                 .modified()
