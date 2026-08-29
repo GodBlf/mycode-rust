@@ -1,11 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use thiserror::Error;
-use uuid::Uuid;
 
-use crate::workspace::WorkspacePaths;
+use crate::workspace::{WorkspacePaths, unique_slug};
 
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -43,29 +40,28 @@ impl PlanFileManager {
         }
     }
 
-    pub fn create(&mut self) -> Result<PathBuf, PlanError> {
-        if let Some(path) = &self.selected_path {
-            return Ok(path.clone());
-        }
-
+    pub fn select_new_path(&mut self) -> Result<PathBuf, PlanError> {
         let directory = self.plans_dir();
         fs::create_dir_all(&directory).map_err(|source| PlanError::CreateDirectory {
             path: directory.clone(),
             source,
         })?;
-        let nanoseconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let path = directory.join(format!("plan-{nanoseconds}-{}.md", Uuid::new_v4().simple()));
+        let path = directory.join(format!("plan-{}.md", unique_slug()));
         self.selected_path = Some(path.clone());
         Ok(path)
+    }
+
+    fn select_path(&mut self) -> Result<PathBuf, PlanError> {
+        if let Some(path) = &self.selected_path {
+            return Ok(path.clone());
+        }
+        self.select_new_path()
     }
 
     pub fn save(&mut self, content: &str) -> Result<PathBuf, PlanError> {
         let path = match self.selected_path.clone() {
             Some(path) => path,
-            None => self.create()?,
+            None => self.select_path()?,
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| PlanError::CreateDirectory {

@@ -1,14 +1,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::conversation::ConversationMessage;
-use crate::workspace::WorkspacePaths;
+use crate::workspace::{WorkspacePaths, unique_slug};
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -78,11 +77,7 @@ impl SessionId {
     }
 
     pub fn generate() -> Self {
-        let nanoseconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        Self(format!("{nanoseconds}-{}", Uuid::new_v4().simple()))
+        Self(unique_slug())
     }
 
     pub fn as_str(&self) -> &str {

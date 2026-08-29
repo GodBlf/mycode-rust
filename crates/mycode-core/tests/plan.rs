@@ -7,7 +7,7 @@ fn plan_manager_creates_saves_loads_and_resets_plans() {
 
     assert_eq!(manager.load().expect("load with no plan"), None);
 
-    let first_path = manager.create().expect("create first plan");
+    let first_path = manager.select_new_path().expect("select first plan path");
     assert!(first_path.starts_with(work.path().join(".mycode/plans")));
     assert!(
         first_path
@@ -24,7 +24,7 @@ fn plan_manager_creates_saves_loads_and_resets_plans() {
     manager.reset();
     assert_eq!(manager.load().expect("load after reset"), None);
 
-    let second_path = manager.create().expect("create second plan");
+    let second_path = manager.select_new_path().expect("select second plan path");
     manager.save("# Second plan").expect("save second plan");
 
     assert_ne!(first_path, second_path);
@@ -41,9 +41,13 @@ fn plan_state_does_not_leak_between_workspaces() {
     let mut first = PlanFileManager::new(first_work.path());
     let mut second = PlanFileManager::new(second_work.path());
 
-    first.create().expect("create first workspace plan");
+    first
+        .select_new_path()
+        .expect("select first workspace plan path");
     first.save("# First").expect("save first workspace plan");
-    second.create().expect("create second workspace plan");
+    second
+        .select_new_path()
+        .expect("select second workspace plan path");
     second.save("# Second").expect("save second workspace plan");
 
     assert_eq!(

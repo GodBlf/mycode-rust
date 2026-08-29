@@ -2,17 +2,13 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 
-use mycode_core::conversation::{ContentBlock, ConversationMessage, MessageRole};
+mod support;
+
+use mycode_core::conversation::{ContentBlock, MessageRole};
 use mycode_core::session::{SessionId, SessionStore};
 use serde_json::json;
 
-fn message(role: MessageRole, content: Vec<ContentBlock>) -> ConversationMessage {
-    ConversationMessage {
-        role,
-        content,
-        timestamp_unix_seconds: 42,
-    }
-}
+use support::message;
 
 fn tool_result() -> ContentBlock {
     ContentBlock::ToolResult {

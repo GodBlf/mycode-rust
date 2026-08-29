@@ -17,7 +17,7 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse config file {}: {source}", path.display())]
+    #[error("failed to parse config file {}", path.display())]
     Parse {
         path: PathBuf,
         #[source]
@@ -189,13 +189,73 @@ pub struct HookConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConfigDocument {
     #[serde(default)]
-    providers: Option<Vec<ProviderConfig>>,
+    providers: Option<Vec<ProviderDocument>>,
     #[serde(default)]
-    permission_mode: Option<PermissionMode>,
+    permission_mode: Option<String>,
     #[serde(default)]
     mcp_servers: Option<Vec<McpServerConfig>>,
     #[serde(default)]
     hooks: Option<Vec<HookConfig>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ProviderDocument {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    thinking: bool,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+}
+
+impl ProviderDocument {
+    fn into_provider(self, index: usize) -> Result<ProviderConfig, ConfigError> {
+        let mut missing_fields = Vec::new();
+        if self.name.is_none() {
+            missing_fields.push("name");
+        }
+        if self.protocol.is_none() {
+            missing_fields.push("protocol");
+        }
+        if self.base_url.is_none() {
+            missing_fields.push("base_url");
+        }
+        if self.model.is_none() {
+            missing_fields.push("model");
+        }
+        if !missing_fields.is_empty() {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "provider {}: missing required field(s): {}",
+                    index + 1,
+                    missing_fields.join(", ")
+                ),
+            });
+        }
+
+        let protocol =
+            parse_provider_protocol(self.protocol.as_deref().unwrap_or_default(), index)?;
+        Ok(ProviderConfig {
+            name: self.name.unwrap_or_default(),
+            protocol,
+            base_url: self.base_url.unwrap_or_default(),
+            model: self.model.unwrap_or_default(),
+            api_key: self.api_key,
+            thinking: self.thinking,
+            context_window: self.context_window,
+            max_output_tokens: self.max_output_tokens,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,12 +297,7 @@ impl Config {
             return Err(ConfigError::NoConfig { paths });
         }
 
-        let config = Self {
-            providers: merged.providers.unwrap_or_default(),
-            permission_mode: merged.permission_mode.unwrap_or_default(),
-            mcp_servers: merged.mcp_servers.unwrap_or_default(),
-            hooks: merged.hooks.unwrap_or_default(),
-        };
+        let config = merged.into_config()?;
         config.validate()?;
         Ok(config)
     }
@@ -401,6 +456,25 @@ fn read_document(path: &Path) -> Result<ConfigDocument, ConfigError> {
     })
 }
 
+impl ConfigDocument {
+    fn into_config(self) -> Result<Config, ConfigError> {
+        let providers = self
+            .providers
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, provider)| provider.into_provider(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let permission_mode = parse_permission_mode(self.permission_mode.as_deref())?;
+        Ok(Config {
+            providers,
+            permission_mode,
+            mcp_servers: self.mcp_servers.unwrap_or_default(),
+            hooks: self.hooks.unwrap_or_default(),
+        })
+    }
+}
+
 fn merge_documents(base: ConfigDocument, override_document: ConfigDocument) -> ConfigDocument {
     let mut merged = base;
     if override_document.providers.is_some() {
@@ -429,6 +503,35 @@ fn merge_documents(base: ConfigDocument, override_document: ConfigDocument) -> C
         merged.hooks = Some(hooks);
     }
     merged
+}
+
+fn parse_provider_protocol(value: &str, index: usize) -> Result<ProviderProtocol, ConfigError> {
+    match value {
+        "anthropic" => Ok(ProviderProtocol::Anthropic),
+        "openai" => Ok(ProviderProtocol::OpenAi),
+        "openai-compat" => Ok(ProviderProtocol::OpenAiCompat),
+        _ => Err(ConfigError::Validation {
+            message: format!(
+                "provider {}: invalid protocol {value:?}; expected anthropic, openai, or openai-compat",
+                index + 1
+            ),
+        }),
+    }
+}
+
+fn parse_permission_mode(value: Option<&str>) -> Result<PermissionMode, ConfigError> {
+    match value {
+        None => Ok(PermissionMode::Default),
+        Some("default") => Ok(PermissionMode::Default),
+        Some("acceptEdits") => Ok(PermissionMode::AcceptEdits),
+        Some("plan") => Ok(PermissionMode::Plan),
+        Some("bypassPermissions") => Ok(PermissionMode::BypassPermissions),
+        Some(value) => Err(ConfigError::Validation {
+            message: format!(
+                "invalid permission_mode {value:?}; expected default, acceptEdits, plan, or bypassPermissions"
+            ),
+        }),
+    }
 }
 
 fn is_http_url(value: &str) -> bool {

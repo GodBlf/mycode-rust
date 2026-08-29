@@ -43,7 +43,7 @@ permission_mode: acceptEdits
         .expect("append session message");
 
     let mut plan_manager = PlanFileManager::new(work.path());
-    let plan_path = plan_manager.create().expect("create plan");
+    let plan_path = plan_manager.select_new_path().expect("select plan path");
     plan_manager.save("# Integration plan").expect("save plan");
 
     let loaded_messages = session_store

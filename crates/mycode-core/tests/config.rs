@@ -1,3 +1,4 @@
+use std::error::Error as ErrorTrait;
 use std::fs;
 use std::path::Path;
 
@@ -8,6 +9,19 @@ use mycode_core::config::{
 fn write(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().expect("config has a parent")).expect("create config dir");
     fs::write(path, contents).expect("write config");
+}
+
+fn write_provider_config(work: &Path, provider_yaml: &str) {
+    let normalized_provider = provider_yaml
+        .trim()
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n    ");
+    write(
+        &work.join(".mycode/config.yaml"),
+        &format!("providers:\n  - {normalized_provider}\n"),
+    );
 }
 
 #[test]
@@ -107,6 +121,17 @@ fn invalid_yaml_and_provider_settings_fail_with_config_errors() {
         error.contains("config.yaml"),
         "error should name the file: {error}"
     );
+    assert!(
+        !error.contains("EOF while parsing"),
+        "error should not leak parser details: {error}"
+    );
+    assert!(
+        Config::load(home.path(), work.path())
+            .expect_err("invalid YAML should fail")
+            .source()
+            .is_some(),
+        "parser source should remain available to the CLI boundary"
+    );
 
     write(
         &work.path().join(".mycode/config.yaml"),
@@ -114,6 +139,7 @@ fn invalid_yaml_and_provider_settings_fail_with_config_errors() {
 providers:
   - name: ""
     protocol: invalid
+    base_url: https://provider.example.test
     model: model
 "#,
     );
@@ -124,6 +150,94 @@ providers:
         error.contains("provider"),
         "error should identify provider: {error}"
     );
+    assert!(
+        error.contains("protocol"),
+        "error should identify the invalid field: {error}"
+    );
+}
+
+#[test]
+fn unreadable_config_errors_do_not_leak_io_details() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let work = tempfile::tempdir().expect("work tempdir");
+    let config_path = work.path().join(".mycode/config.yaml");
+    fs::create_dir_all(&config_path).expect("create config path as a directory");
+
+    let error = Config::load(home.path(), work.path())
+        .expect_err("unreadable config should fail")
+        .to_string();
+
+    assert!(
+        error.contains("failed to read config file"),
+        "error should describe the domain failure: {error}"
+    );
+    assert!(
+        !error.contains("Is a directory"),
+        "error should not leak IO details: {error}"
+    );
+    assert!(
+        Config::load(home.path(), work.path())
+            .expect_err("unreadable config should fail")
+            .source()
+            .is_some(),
+        "IO source should remain available to the CLI boundary"
+    );
+}
+
+#[test]
+fn missing_provider_fields_are_reported_individually() {
+    let cases = [
+        (
+            r#"
+  protocol: anthropic
+  base_url: https://provider.example.test
+  model: model
+"#,
+            "name",
+        ),
+        (
+            r#"
+  name: provider
+  base_url: https://provider.example.test
+  model: model
+"#,
+            "protocol",
+        ),
+        (
+            r#"
+  name: provider
+  protocol: anthropic
+  model: model
+"#,
+            "base_url",
+        ),
+        (
+            r#"
+  name: provider
+  protocol: anthropic
+  base_url: https://provider.example.test
+"#,
+            "model",
+        ),
+    ];
+
+    for (provider_yaml, field) in cases {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let work = tempfile::tempdir().expect("work tempdir");
+        write_provider_config(work.path(), provider_yaml.trim());
+
+        let error = Config::load(home.path(), work.path())
+            .expect_err("missing provider field should fail")
+            .to_string();
+        assert!(
+            error.contains("provider 1"),
+            "error should identify the provider: {error}"
+        );
+        assert!(
+            error.contains(field),
+            "error should identify missing field {field}: {error}"
+        );
+    }
 }
 
 #[test]

@@ -1,13 +1,9 @@
-use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
+mod support;
+
+use mycode_core::conversation::{ContentBlock, Conversation, MessageRole};
 use serde_json::json;
 
-fn message(role: MessageRole, content: Vec<ContentBlock>) -> ConversationMessage {
-    ConversationMessage {
-        role,
-        content,
-        timestamp_unix_seconds: 42,
-    }
-}
+use support::message;
 
 #[test]
 fn conversation_round_trips_every_content_block_kind_in_order() {

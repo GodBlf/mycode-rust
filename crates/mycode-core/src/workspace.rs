@@ -1,4 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct WorkspacePaths {
@@ -31,4 +34,12 @@ impl WorkspacePaths {
     pub fn plans_dir(&self) -> PathBuf {
         self.work_dir.join(".mycode/plans")
     }
+}
+
+pub(crate) fn unique_slug() -> String {
+    let nanoseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{nanoseconds}-{}", Uuid::new_v4().simple())
 }
