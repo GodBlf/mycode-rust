@@ -34,6 +34,18 @@ impl WorkspacePaths {
     pub fn plans_dir(&self) -> PathBuf {
         self.work_dir.join(".mycode/plans")
     }
+
+    pub fn file_history_dir(&self) -> PathBuf {
+        self.work_dir.join(".mycode/file-history")
+    }
+
+    pub fn permissions_file(&self) -> PathBuf {
+        self.work_dir.join(".mycode/permissions.yaml")
+    }
+
+    pub fn local_permissions_file(&self) -> PathBuf {
+        self.work_dir.join(".mycode/permissions.local.yaml")
+    }
 }
 
 pub(crate) fn unique_slug() -> String {
