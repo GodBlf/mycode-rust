@@ -3,9 +3,9 @@ use tokio_util::sync::CancellationToken;
 
 use mycode_core::conversation::Conversation;
 
-use crate::events::{LlmError, LlmEvent};
+use crate::events::{ProviderError, ProviderEvent};
 
-pub type LlmStream = mpsc::Receiver<Result<LlmEvent, LlmError>>;
+pub type ProviderStream = mpsc::Receiver<Result<ProviderEvent, ProviderError>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
@@ -15,7 +15,7 @@ pub struct ToolDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct LlmRequest {
+pub struct ProviderRequest {
     pub system_prompt: String,
     pub conversation: Conversation,
     pub tools: Vec<ToolDefinition>,
@@ -25,7 +25,7 @@ pub struct LlmRequest {
 pub trait LlmClient: Send + Sync {
     async fn stream(
         &self,
-        request: LlmRequest,
+        request: ProviderRequest,
         cancellation: CancellationToken,
-    ) -> Result<LlmStream, LlmError>;
+    ) -> Result<ProviderStream, ProviderError>;
 }

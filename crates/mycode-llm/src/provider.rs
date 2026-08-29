@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::anthropic::AnthropicClient;
 use crate::client::LlmClient;
-use crate::events::LlmError;
+use crate::events::ProviderError;
 use crate::limits::{context_window, max_output_tokens};
 use crate::openai::OpenAiClient;
 use crate::openai_compat::OpenAiCompatClient;
@@ -21,20 +21,14 @@ pub struct ProviderClient {
 
 pub async fn build_provider_client(
     provider: &ProviderConfig,
-    system_prompt: impl Into<String>,
-) -> Result<ProviderClient, LlmError> {
-    build_provider_client_with(provider, system_prompt, |variable| {
-        std::env::var(variable).ok()
-    })
-    .await
+) -> Result<ProviderClient, ProviderError> {
+    build_provider_client_with(provider, |variable| std::env::var(variable).ok()).await
 }
 
 pub async fn build_provider_client_with(
     provider: &ProviderConfig,
-    system_prompt: impl Into<String>,
     lookup: impl Fn(&str) -> Option<String>,
-) -> Result<ProviderClient, LlmError> {
-    let system_prompt = system_prompt.into();
+) -> Result<ProviderClient, ProviderError> {
     let api_key = provider
         .resolve_api_key_with(lookup)
         .ok_or_else(authentication_error)?;
@@ -50,15 +44,13 @@ pub async fn build_provider_client_with(
             };
             let context_window = context_window(&provider, fetched);
             return Ok(ProviderClient {
-                client: Box::new(AnthropicClient::new(&provider, system_prompt)?),
+                client: Box::new(AnthropicClient::new(&provider)?),
                 context_window,
                 max_output_tokens: max_output,
             });
         }
-        ProviderProtocol::OpenAi => Box::new(OpenAiClient::new(&provider, system_prompt)?),
-        ProviderProtocol::OpenAiCompat => {
-            Box::new(OpenAiCompatClient::new(&provider, system_prompt)?)
-        }
+        ProviderProtocol::OpenAi => Box::new(OpenAiClient::new(&provider)?),
+        ProviderProtocol::OpenAiCompat => Box::new(OpenAiCompatClient::new(&provider)?),
     };
 
     Ok(ProviderClient {
@@ -74,29 +66,30 @@ async fn fetch_anthropic_context_window(provider: &ProviderConfig, api_key: &str
         provider.base_url.trim_end_matches('/'),
         provider.model
     );
-    let response = tokio::time::timeout(
-        MODEL_METADATA_TIMEOUT,
-        Client::new()
+    let fetch = async {
+        let response = Client::new()
             .get(endpoint)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
-            .send(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
 
-    let body: Value = response.json().await.ok()?;
-    body.get("max_input_tokens")
-        .and_then(Value::as_u64)
-        .filter(|tokens| *tokens > 0)
+        let body: Value = response.json().await.ok()?;
+        body.get("max_input_tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0)
+    };
+    tokio::time::timeout(MODEL_METADATA_TIMEOUT, fetch)
+        .await
+        .ok()?
 }
 
-fn authentication_error() -> LlmError {
-    LlmError::Authentication {
+fn authentication_error() -> ProviderError {
+    ProviderError::Authentication {
         message:
             "Provider API key not found; set provider api_key or its protocol environment variable"
                 .into(),

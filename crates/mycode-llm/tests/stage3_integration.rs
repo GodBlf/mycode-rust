@@ -3,7 +3,7 @@ mod support;
 use mycode_core::config::{ProviderConfig, ProviderProtocol};
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
 use mycode_llm::{
-    LlmError, LlmEvent, StopReason, ToolDefinition, Usage, build_provider_client_with,
+    ProviderError, ProviderEvent, StopReason, ToolDefinition, Usage, build_provider_client_with,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -20,7 +20,7 @@ fn provider(protocol: ProviderProtocol, base_url: String) -> ProviderConfig {
     }
 }
 
-fn request() -> mycode_llm::LlmRequest {
+fn request() -> mycode_llm::ProviderRequest {
     let mut conversation = Conversation::new();
     conversation.push(ConversationMessage {
         role: MessageRole::User,
@@ -30,7 +30,7 @@ fn request() -> mycode_llm::LlmRequest {
         timestamp_unix_seconds: 1,
     });
 
-    mycode_llm::LlmRequest {
+    mycode_llm::ProviderRequest {
         system_prompt: "system".into(),
         conversation,
         tools: vec![ToolDefinition {
@@ -78,7 +78,7 @@ async fn provider_factory_streams_equivalent_events_for_all_protocols() {
 
     for (protocol, response) in cases {
         let (base_url, request_receiver) = support::serve_once(response).await;
-        let built = build_provider_client_with(&provider(protocol, base_url), "system", |_| {
+        let built = build_provider_client_with(&provider(protocol, base_url), |_| {
             Some("environment-key".into())
         })
         .await
@@ -98,10 +98,10 @@ async fn provider_factory_streams_equivalent_events_for_all_protocols() {
         assert_eq!(
             events,
             vec![
-                LlmEvent::TextDelta {
+                ProviderEvent::TextDelta {
                     text: "hello".into()
                 },
-                LlmEvent::StreamEnd {
+                ProviderEvent::StreamEnd {
                     stop_reason: StopReason::EndTurn,
                     usage: Usage {
                         input_tokens: 10,
@@ -126,7 +126,7 @@ async fn cancellation_is_consistent_for_every_protocol() {
         ProviderProtocol::OpenAiCompat,
     ] {
         let base_url = support::serve_hanging().await;
-        let built = build_provider_client_with(&provider(protocol, base_url), "system", |_| {
+        let built = build_provider_client_with(&provider(protocol, base_url), |_| {
             Some("environment-key".into())
         })
         .await
@@ -141,7 +141,7 @@ async fn cancellation_is_consistent_for_every_protocol() {
         cancellation.cancel();
         assert_eq!(
             stream.recv().await,
-            Some(Err(LlmError::Cancelled)),
+            Some(Err(ProviderError::Cancelled)),
             "protocol {protocol:?} should honour cancellation"
         );
     }
@@ -149,43 +149,58 @@ async fn cancellation_is_consistent_for_every_protocol() {
 
 #[tokio::test]
 async fn malformed_sse_is_reported_as_invalid_response() {
-    let (base_url, _request) = support::serve_once(support::sse_response(&["not-json"])).await;
-    let built = build_provider_client_with(
-        &provider(ProviderProtocol::Anthropic, base_url),
-        "system",
-        |_| Some("environment-key".into()),
-    )
-    .await
-    .expect("provider should build");
-
-    let mut stream = built
-        .client
-        .stream(request(), CancellationToken::new())
+    for protocol in [
+        ProviderProtocol::Anthropic,
+        ProviderProtocol::OpenAi,
+        ProviderProtocol::OpenAiCompat,
+    ] {
+        let (base_url, _request) = support::serve_once(support::sse_response(&["not-json"])).await;
+        let built = build_provider_client_with(&provider(protocol, base_url), |_| {
+            Some("environment-key".into())
+        })
         .await
-        .expect("stream should start");
-    assert!(matches!(
-        stream.recv().await,
-        Some(Err(LlmError::InvalidResponse { .. }))
-    ));
+        .expect("provider should build");
+
+        let mut stream = built
+            .client
+            .stream(request(), CancellationToken::new())
+            .await
+            .expect("stream should start");
+        assert!(
+            matches!(
+                stream.recv().await,
+                Some(Err(ProviderError::InvalidResponse { .. }))
+            ),
+            "protocol {protocol:?} should report malformed SSE"
+        );
+    }
 }
 
 #[tokio::test]
 async fn connection_failures_are_reported_as_network_errors() {
-    let built = build_provider_client_with(
-        &provider(ProviderProtocol::OpenAi, "http://127.0.0.1:1".into()),
-        "system",
-        |_| Some("environment-key".into()),
-    )
-    .await
-    .expect("provider should build");
+    for protocol in [
+        ProviderProtocol::Anthropic,
+        ProviderProtocol::OpenAi,
+        ProviderProtocol::OpenAiCompat,
+    ] {
+        let built =
+            build_provider_client_with(&provider(protocol, "http://127.0.0.1:1".into()), |_| {
+                Some("environment-key".into())
+            })
+            .await
+            .expect("provider should build");
 
-    let mut stream = built
-        .client
-        .stream(request(), CancellationToken::new())
-        .await
-        .expect("stream should start");
-    assert!(matches!(
-        stream.recv().await,
-        Some(Err(LlmError::Network { .. }))
-    ));
+        let mut stream = built
+            .client
+            .stream(request(), CancellationToken::new())
+            .await
+            .expect("stream should start");
+        assert!(
+            matches!(
+                stream.recv().await,
+                Some(Err(ProviderError::Network { .. }))
+            ),
+            "protocol {protocol:?} should report connection failure"
+        );
+    }
 }

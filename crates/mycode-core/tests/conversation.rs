@@ -20,6 +20,7 @@ fn conversation_round_trips_every_content_block_kind_in_order() {
             ContentBlock::Thinking {
                 thinking: "I will inspect the files".into(),
                 signature: "signature".into(),
+                encrypted_content: String::new(),
             },
             ContentBlock::ToolUse {
                 tool_use_id: "tool-1".into(),

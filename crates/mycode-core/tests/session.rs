@@ -44,6 +44,7 @@ fn session_append_and_load_round_trip_typed_messages_in_order() {
                     ContentBlock::Thinking {
                         thinking: "thinking".into(),
                         signature: "signature".into(),
+                        encrypted_content: String::new(),
                     },
                     ContentBlock::ToolUse {
                         tool_use_id: "tool-1".into(),

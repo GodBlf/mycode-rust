@@ -3,7 +3,7 @@ mod support;
 use mycode_core::config::{ProviderConfig, ProviderProtocol};
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
 use mycode_llm::{
-    AnthropicClient, LlmClient, LlmError, LlmEvent, StopReason, ToolDefinition, Usage,
+    AnthropicClient, LlmClient, ProviderError, ProviderEvent, StopReason, ToolDefinition, Usage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +33,7 @@ fn adaptive_provider(base_url: String) -> ProviderConfig {
     }
 }
 
-fn request() -> mycode_llm::LlmRequest {
+fn request() -> mycode_llm::ProviderRequest {
     let mut conversation = Conversation::new();
     conversation.push(ConversationMessage {
         role: MessageRole::User,
@@ -48,6 +48,7 @@ fn request() -> mycode_llm::LlmRequest {
             ContentBlock::Thinking {
                 thinking: "I should read the file".into(),
                 signature: "signature".into(),
+                encrypted_content: String::new(),
             },
             ContentBlock::Text {
                 text: "I will read it".into(),
@@ -70,7 +71,7 @@ fn request() -> mycode_llm::LlmRequest {
         timestamp_unix_seconds: 3,
     });
 
-    mycode_llm::LlmRequest {
+    mycode_llm::ProviderRequest {
         system_prompt: "be concise".into(),
         conversation,
         tools: vec![ToolDefinition {
@@ -89,8 +90,8 @@ fn request() -> mycode_llm::LlmRequest {
 async fn anthropic_adaptive_thinking_models_use_adaptive_mode() {
     let (base_url, request_receiver) =
         support::serve_once(support::sse_response(&[r#"{"type":"message_stop"}"#])).await;
-    let client = AnthropicClient::new(&adaptive_provider(base_url), "system")
-        .expect("client should construct");
+    let client =
+        AnthropicClient::new(&adaptive_provider(base_url)).expect("client should construct");
     let mut stream = client
         .stream(request(), CancellationToken::new())
         .await
@@ -122,8 +123,7 @@ async fn anthropic_client_builds_requests_and_decodes_streaming_events() {
         r#"{"type":"message_stop"}"#,
     ]);
     let (base_url, request_receiver) = support::serve_once(response).await;
-    let client =
-        AnthropicClient::new(&provider(base_url), "be concise").expect("client should construct");
+    let client = AnthropicClient::new(&provider(base_url)).expect("client should construct");
 
     let mut stream = client
         .stream(request(), CancellationToken::new())
@@ -137,28 +137,29 @@ async fn anthropic_client_builds_requests_and_decodes_streaming_events() {
     assert_eq!(
         events,
         vec![
-            LlmEvent::TextDelta {
+            ProviderEvent::TextDelta {
                 text: "hello".into()
             },
-            LlmEvent::ThinkingDelta {
+            ProviderEvent::ThinkingDelta {
                 text: "thinking".into()
             },
-            LlmEvent::ThinkingComplete {
+            ProviderEvent::ThinkingComplete {
                 thinking: "thinking".into(),
-                signature: "signature".into()
+                signature: "signature".into(),
+                encrypted_content: String::new()
             },
-            LlmEvent::ToolCallDelta {
+            ProviderEvent::ToolCallDelta {
                 text: "{\"path\":".into()
             },
-            LlmEvent::ToolCallDelta {
+            ProviderEvent::ToolCallDelta {
                 text: "\"README.md\"}".into()
             },
-            LlmEvent::ToolCallComplete {
+            ProviderEvent::ToolCallComplete {
                 tool_id: "call-2".into(),
                 tool_name: "read_file".into(),
                 arguments: serde_json::json!({"path": "README.md"}),
             },
-            LlmEvent::StreamEnd {
+            ProviderEvent::StreamEnd {
                 stop_reason: StopReason::ToolUse,
                 usage: Usage {
                     input_tokens: 120,
@@ -231,8 +232,7 @@ async fn anthropic_client_maps_http_authentication_errors() {
         r#"{"error":{"message":"invalid api key"}}"#,
     ))
     .await;
-    let client =
-        AnthropicClient::new(&provider(base_url), "system").expect("client should construct");
+    let client = AnthropicClient::new(&provider(base_url)).expect("client should construct");
 
     let mut stream = client
         .stream(request(), CancellationToken::new())
@@ -240,15 +240,14 @@ async fn anthropic_client_maps_http_authentication_errors() {
         .expect("stream should start");
     assert!(matches!(
         stream.recv().await,
-        Some(Err(LlmError::Authentication { .. }))
+        Some(Err(ProviderError::Authentication { .. }))
     ));
 }
 
 #[tokio::test]
 async fn anthropic_client_cancellation_aborts_request() {
     let base_url = support::serve_hanging().await;
-    let client =
-        AnthropicClient::new(&provider(base_url), "system").expect("client should construct");
+    let client = AnthropicClient::new(&provider(base_url)).expect("client should construct");
     let cancellation = CancellationToken::new();
     let mut stream = client
         .stream(request(), cancellation.clone())
@@ -256,5 +255,5 @@ async fn anthropic_client_cancellation_aborts_request() {
         .expect("stream should start");
 
     cancellation.cancel();
-    assert_eq!(stream.recv().await, Some(Err(LlmError::Cancelled)));
+    assert_eq!(stream.recv().await, Some(Err(ProviderError::Cancelled)));
 }

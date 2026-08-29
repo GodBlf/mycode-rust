@@ -1,8 +1,10 @@
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
-use mycode_llm::{LlmClient, LlmError, LlmEvent, MockClient, StopReason, ToolDefinition, Usage};
+use mycode_llm::{
+    LlmClient, MockClient, ProviderError, ProviderEvent, StopReason, ToolDefinition, Usage,
+};
 use tokio_util::sync::CancellationToken;
 
-fn request() -> mycode_llm::LlmRequest {
+fn request() -> mycode_llm::ProviderRequest {
     let mut conversation = Conversation::new();
     conversation.push(ConversationMessage {
         role: MessageRole::User,
@@ -12,7 +14,7 @@ fn request() -> mycode_llm::LlmRequest {
         timestamp_unix_seconds: 1,
     });
 
-    mycode_llm::LlmRequest {
+    mycode_llm::ProviderRequest {
         system_prompt: "system".into(),
         conversation,
         tools: vec![ToolDefinition {
@@ -30,10 +32,10 @@ fn request() -> mycode_llm::LlmRequest {
 #[tokio::test]
 async fn mock_client_replays_events_and_captures_the_request() {
     let client = MockClient::new(vec![
-        LlmEvent::TextDelta {
+        ProviderEvent::TextDelta {
             text: "hello".into(),
         },
-        LlmEvent::StreamEnd {
+        ProviderEvent::StreamEnd {
             stop_reason: StopReason::EndTurn,
             usage: Usage {
                 input_tokens: 10,
@@ -51,13 +53,13 @@ async fn mock_client_replays_events_and_captures_the_request() {
 
     assert_eq!(
         stream.recv().await,
-        Some(Ok(LlmEvent::TextDelta {
+        Some(Ok(ProviderEvent::TextDelta {
             text: "hello".into()
         }))
     );
     assert_eq!(
         stream.recv().await,
-        Some(Ok(LlmEvent::StreamEnd {
+        Some(Ok(ProviderEvent::StreamEnd {
             stop_reason: StopReason::EndTurn,
             usage: Usage {
                 input_tokens: 10,
@@ -78,27 +80,37 @@ async fn mock_client_replays_events_and_captures_the_request() {
 
 #[tokio::test]
 async fn mock_client_replays_errors_and_cancellation() {
-    let client = MockClient::with_results(vec![
-        Ok(LlmEvent::TextDelta {
-            text: "partial".into(),
-        }),
-        Err(LlmError::Authentication {
-            message: "invalid key".into(),
-        }),
-    ]);
-
-    let cancellation = CancellationToken::new();
-    let mut stream = client
-        .stream(request(), cancellation.clone())
+    let error_client = MockClient::with_results(vec![Err(ProviderError::Authentication {
+        message: "invalid key".into(),
+    })]);
+    let mut error_stream = error_client
+        .stream(request(), CancellationToken::new())
         .await
         .expect("mock stream should start");
-
     assert_eq!(
-        stream.recv().await,
-        Some(Ok(LlmEvent::TextDelta {
-            text: "partial".into()
+        error_stream.recv().await,
+        Some(Err(ProviderError::Authentication {
+            message: "invalid key".into()
         }))
     );
+
+    let cancelled_client = MockClient::new(vec![
+        ProviderEvent::TextDelta {
+            text: "partial".into(),
+        },
+        ProviderEvent::StreamEnd {
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        },
+    ]);
+    let cancellation = CancellationToken::new();
     cancellation.cancel();
-    assert_eq!(stream.recv().await, Some(Err(LlmError::Cancelled)));
+    let mut cancelled_stream = cancelled_client
+        .stream(request(), cancellation)
+        .await
+        .expect("mock stream should start");
+    assert_eq!(
+        cancelled_stream.recv().await,
+        Some(Err(ProviderError::Cancelled))
+    );
 }

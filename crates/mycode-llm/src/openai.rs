@@ -2,12 +2,11 @@ use mycode_core::config::ProviderConfig;
 use mycode_core::conversation::{ContentBlock, ConversationMessage, MessageRole};
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{LlmClient, LlmRequest, LlmStream, ToolDefinition};
-use crate::events::{LlmError, LlmEvent, StopReason, Usage};
-use crate::http::{SseDecoder, run_sse_stream};
+use crate::client::{LlmClient, ProviderRequest, ProviderStream, ToolDefinition};
+use crate::events::{ProviderError, ProviderEvent, StopReason, Usage};
+use crate::http::{SseDecoder, spawn_sse_stream};
 use crate::limits::max_output_tokens;
 use crate::sse::SseEvent;
 
@@ -18,19 +17,15 @@ pub struct OpenAiClient {
     base_url: String,
     model: String,
     thinking: bool,
-    instructions: String,
     max_output_tokens: u64,
 }
 
 impl OpenAiClient {
-    pub fn new(
-        provider: &ProviderConfig,
-        instructions: impl Into<String>,
-    ) -> Result<Self, LlmError> {
+    pub fn new(provider: &ProviderConfig) -> Result<Self, ProviderError> {
         let api_key =
             provider
                 .resolve_api_key_from_env()
-                .ok_or_else(|| LlmError::Authentication {
+                .ok_or_else(|| ProviderError::Authentication {
                     message: "OpenAI API key not found; set provider api_key or OPENAI_API_KEY"
                         .into(),
                 })?;
@@ -41,12 +36,11 @@ impl OpenAiClient {
             base_url: provider.base_url.trim_end_matches('/').to_string(),
             model: provider.model.clone(),
             thinking: provider.thinking,
-            instructions: instructions.into(),
             max_output_tokens: max_output_tokens(provider),
         })
     }
 
-    fn request_body(&self, request: &LlmRequest) -> Value {
+    fn request_body(&self, request: &ProviderRequest) -> Value {
         let input: Vec<Value> = request
             .conversation
             .messages()
@@ -57,7 +51,7 @@ impl OpenAiClient {
         let mut body = json!({
             "model": self.model,
             "max_output_tokens": self.max_output_tokens,
-            "instructions": self.instructions,
+            "instructions": request.system_prompt,
             "input": input,
             "stream": true,
         });
@@ -81,30 +75,23 @@ impl OpenAiClient {
 impl LlmClient for OpenAiClient {
     async fn stream(
         &self,
-        request: LlmRequest,
+        request: ProviderRequest,
         cancellation: CancellationToken,
-    ) -> Result<LlmStream, LlmError> {
+    ) -> Result<ProviderStream, ProviderError> {
         let body = self.request_body(&request);
         let endpoint = self.endpoint();
         let http = self.http.clone();
         let api_key = self.api_key.clone();
-        let (sender, receiver) = mpsc::channel(64);
         let state = OpenAiResponsesStreamState::default();
 
-        tokio::spawn(async move {
-            run_sse_stream(
-                http,
-                endpoint,
-                vec![("authorization", format!("Bearer {api_key}"))],
-                body,
-                cancellation,
-                sender,
-                state,
-            )
-            .await;
-        });
-
-        Ok(receiver)
+        Ok(spawn_sse_stream(
+            http,
+            endpoint,
+            vec![("authorization", format!("Bearer {api_key}"))],
+            body,
+            cancellation,
+            state,
+        ))
     }
 }
 
@@ -122,11 +109,18 @@ fn openai_input_items(message: &ConversationMessage) -> Vec<Value> {
                 ContentBlock::Thinking {
                     thinking,
                     signature,
-                } => json!({
-                    "type": "reasoning",
-                    "id": signature,
-                    "summary": [{"type": "summary_text", "text": thinking}],
-                }),
+                    encrypted_content,
+                } => {
+                    let mut reasoning = json!({
+                        "type": "reasoning",
+                        "id": signature,
+                        "summary": [{"type": "summary_text", "text": thinking}],
+                    });
+                    if !encrypted_content.is_empty() {
+                        reasoning["encrypted_content"] = Value::String(encrypted_content.clone());
+                    }
+                    reasoning
+                }
                 ContentBlock::ToolUse {
                     tool_use_id,
                     tool_name,
@@ -188,6 +182,7 @@ struct OpenAiResponsesStreamState {
     usage: Usage,
     saw_tool_call: bool,
     reasoning_id: String,
+    reasoning_encrypted_content: String,
     reasoning_text: String,
     current_tool_id: String,
     current_tool_name: String,
@@ -195,9 +190,9 @@ struct OpenAiResponsesStreamState {
 }
 
 impl SseDecoder for OpenAiResponsesStreamState {
-    fn decode(&mut self, event: &SseEvent) -> Result<Vec<LlmEvent>, LlmError> {
+    fn decode(&mut self, event: &SseEvent) -> Result<Vec<ProviderEvent>, ProviderError> {
         let data: Value =
-            serde_json::from_str(&event.data).map_err(|error| LlmError::InvalidResponse {
+            serde_json::from_str(&event.data).map_err(|error| ProviderError::InvalidResponse {
                 message: format!("invalid OpenAI SSE JSON: {error}"),
             })?;
         let event_type = data
@@ -207,7 +202,7 @@ impl SseDecoder for OpenAiResponsesStreamState {
             .unwrap_or_default();
 
         match event_type {
-            "response.output_text.delta" => Ok(vec![LlmEvent::TextDelta {
+            "response.output_text.delta" => Ok(vec![ProviderEvent::TextDelta {
                 text: required_string(&data, "delta")?,
             }]),
             "response.output_item.added" => {
@@ -218,7 +213,7 @@ impl SseDecoder for OpenAiResponsesStreamState {
                         self.current_tool_name = required_string(item, "name")?;
                         self.tool_arguments.clear();
                         self.saw_tool_call = true;
-                        Ok(vec![LlmEvent::ToolCallStart {
+                        Ok(vec![ProviderEvent::ToolCallStart {
                             tool_id: self.current_tool_id.clone(),
                             tool_name: self.current_tool_name.clone(),
                         }])
@@ -226,6 +221,11 @@ impl SseDecoder for OpenAiResponsesStreamState {
                     Some("reasoning") => {
                         self.reasoning_id = item
                             .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        self.reasoning_encrypted_content = item
+                            .get("encrypted_content")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
@@ -238,28 +238,29 @@ impl SseDecoder for OpenAiResponsesStreamState {
             "response.reasoning_summary_text.delta" => {
                 let text = required_string(&data, "delta")?;
                 self.reasoning_text.push_str(&text);
-                Ok(vec![LlmEvent::ThinkingDelta { text }])
+                Ok(vec![ProviderEvent::ThinkingDelta { text }])
             }
-            "response.reasoning_summary_text.done" => Ok(vec![LlmEvent::ThinkingComplete {
+            "response.reasoning_summary_text.done" => Ok(vec![ProviderEvent::ThinkingComplete {
                 thinking: self.reasoning_text.clone(),
                 signature: self.reasoning_id.clone(),
+                encrypted_content: self.reasoning_encrypted_content.clone(),
             }]),
             "response.function_call_arguments.delta" => {
                 let text = required_string(&data, "delta")?;
                 self.tool_arguments.push_str(&text);
-                Ok(vec![LlmEvent::ToolCallDelta { text }])
+                Ok(vec![ProviderEvent::ToolCallDelta { text }])
             }
             "response.function_call_arguments.done" => {
                 let arguments = if self.tool_arguments.is_empty() {
                     Value::Object(serde_json::Map::new())
                 } else {
                     serde_json::from_str(&self.tool_arguments).map_err(|error| {
-                        LlmError::InvalidResponse {
+                        ProviderError::InvalidResponse {
                             message: format!("invalid OpenAI Tool arguments: {error}"),
                         }
                     })?
                 };
-                Ok(vec![LlmEvent::ToolCallComplete {
+                Ok(vec![ProviderEvent::ToolCallComplete {
                     tool_id: self.current_tool_id.clone(),
                     tool_name: self.current_tool_name.clone(),
                     arguments,
@@ -285,7 +286,7 @@ impl SseDecoder for OpenAiResponsesStreamState {
                         cache_creation_tokens: 0,
                     };
                 }
-                Ok(vec![LlmEvent::StreamEnd {
+                Ok(vec![ProviderEvent::StreamEnd {
                     stop_reason: if self.saw_tool_call {
                         StopReason::ToolUse
                     } else {
@@ -299,7 +300,7 @@ impl SseDecoder for OpenAiResponsesStreamState {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown OpenAI stream error");
-                Err(LlmError::InvalidResponse {
+                Err(ProviderError::InvalidResponse {
                     message: message.to_string(),
                 })
             }
@@ -308,18 +309,18 @@ impl SseDecoder for OpenAiResponsesStreamState {
     }
 }
 
-fn required_string(object: &Value, field: &str) -> Result<String, LlmError> {
+fn required_string(object: &Value, field: &str) -> Result<String, ProviderError> {
     object
         .get(field)
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .ok_or_else(|| LlmError::InvalidResponse {
+        .ok_or_else(|| ProviderError::InvalidResponse {
             message: format!("OpenAI response is missing string field {field:?}"),
         })
 }
 
-fn invalid_response() -> LlmError {
-    LlmError::InvalidResponse {
+fn invalid_response() -> ProviderError {
+    ProviderError::InvalidResponse {
         message: "OpenAI response was missing an expected field".into(),
     }
 }

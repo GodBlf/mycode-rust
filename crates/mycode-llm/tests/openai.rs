@@ -2,7 +2,9 @@ mod support;
 
 use mycode_core::config::{ProviderConfig, ProviderProtocol};
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
-use mycode_llm::{LlmClient, LlmError, LlmEvent, OpenAiClient, StopReason, ToolDefinition, Usage};
+use mycode_llm::{
+    LlmClient, OpenAiClient, ProviderError, ProviderEvent, StopReason, ToolDefinition, Usage,
+};
 use tokio_util::sync::CancellationToken;
 
 fn provider(base_url: String) -> ProviderConfig {
@@ -18,7 +20,7 @@ fn provider(base_url: String) -> ProviderConfig {
     }
 }
 
-fn request() -> mycode_llm::LlmRequest {
+fn request() -> mycode_llm::ProviderRequest {
     let mut conversation = Conversation::new();
     conversation.push(ConversationMessage {
         role: MessageRole::User,
@@ -33,6 +35,7 @@ fn request() -> mycode_llm::LlmRequest {
             ContentBlock::Thinking {
                 thinking: "I should read the file".into(),
                 signature: "reasoning-id".into(),
+                encrypted_content: "encrypted-reasoning".into(),
             },
             ContentBlock::Text {
                 text: "I will read it".into(),
@@ -55,7 +58,7 @@ fn request() -> mycode_llm::LlmRequest {
         timestamp_unix_seconds: 3,
     });
 
-    mycode_llm::LlmRequest {
+    mycode_llm::ProviderRequest {
         system_prompt: "be concise".into(),
         conversation,
         tools: vec![ToolDefinition {
@@ -74,7 +77,7 @@ fn request() -> mycode_llm::LlmRequest {
 async fn openai_client_builds_requests_and_decodes_streaming_events() {
     let response = support::sse_response(&[
         r#"{"type":"response.output_text.delta","delta":"hello"}"#,
-        r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"reasoning-id"}}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"reasoning-id","encrypted_content":"encrypted-response"}}"#,
         r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
         r#"{"type":"response.reasoning_summary_text.done"}"#,
         r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-2","name":"read_file"}}"#,
@@ -84,8 +87,7 @@ async fn openai_client_builds_requests_and_decodes_streaming_events() {
         r#"{"type":"response.completed","response":{"usage":{"input_tokens":120,"output_tokens":42,"input_tokens_details":{"cached_tokens":20}}}}"#,
     ]);
     let (base_url, request_receiver) = support::serve_once(response).await;
-    let client =
-        OpenAiClient::new(&provider(base_url), "be concise").expect("client should construct");
+    let client = OpenAiClient::new(&provider(base_url)).expect("client should construct");
 
     let mut stream = client
         .stream(request(), CancellationToken::new())
@@ -99,32 +101,33 @@ async fn openai_client_builds_requests_and_decodes_streaming_events() {
     assert_eq!(
         events,
         vec![
-            LlmEvent::TextDelta {
+            ProviderEvent::TextDelta {
                 text: "hello".into()
             },
-            LlmEvent::ThinkingDelta {
+            ProviderEvent::ThinkingDelta {
                 text: "thinking".into()
             },
-            LlmEvent::ThinkingComplete {
+            ProviderEvent::ThinkingComplete {
                 thinking: "thinking".into(),
-                signature: "reasoning-id".into()
+                signature: "reasoning-id".into(),
+                encrypted_content: "encrypted-response".into()
             },
-            LlmEvent::ToolCallStart {
+            ProviderEvent::ToolCallStart {
                 tool_id: "call-2".into(),
                 tool_name: "read_file".into()
             },
-            LlmEvent::ToolCallDelta {
+            ProviderEvent::ToolCallDelta {
                 text: "{\"path\":".into()
             },
-            LlmEvent::ToolCallDelta {
+            ProviderEvent::ToolCallDelta {
                 text: "\"README.md\"}".into()
             },
-            LlmEvent::ToolCallComplete {
+            ProviderEvent::ToolCallComplete {
                 tool_id: "call-2".into(),
                 tool_name: "read_file".into(),
                 arguments: serde_json::json!({"path": "README.md"}),
             },
-            LlmEvent::StreamEnd {
+            ProviderEvent::StreamEnd {
                 stop_reason: StopReason::ToolUse,
                 usage: Usage {
                     input_tokens: 100,
@@ -150,6 +153,7 @@ async fn openai_client_builds_requests_and_decodes_streaming_events() {
         serde_json::json!({
             "type": "reasoning",
             "id": "reasoning-id",
+            "encrypted_content": "encrypted-reasoning",
             "summary": [{"type": "summary_text", "text": "I should read the file"}]
         })
     );
@@ -192,7 +196,7 @@ async fn openai_client_builds_requests_and_decodes_streaming_events() {
 async fn openai_client_maps_http_rate_limit_errors() {
     let response = support::http_response(429, r#"{"error":{"message":"rate limited"}}"#);
     let (base_url, _request) = support::serve_once(response).await;
-    let client = OpenAiClient::new(&provider(base_url), "system").expect("client should construct");
+    let client = OpenAiClient::new(&provider(base_url)).expect("client should construct");
 
     let mut stream = client
         .stream(request(), CancellationToken::new())
@@ -200,14 +204,14 @@ async fn openai_client_maps_http_rate_limit_errors() {
         .expect("stream should start");
     assert!(matches!(
         stream.recv().await,
-        Some(Err(LlmError::RateLimit { .. }))
+        Some(Err(ProviderError::RateLimit { .. }))
     ));
 }
 
 #[tokio::test]
 async fn openai_client_cancellation_aborts_request() {
     let base_url = support::serve_hanging().await;
-    let client = OpenAiClient::new(&provider(base_url), "system").expect("client should construct");
+    let client = OpenAiClient::new(&provider(base_url)).expect("client should construct");
     let cancellation = CancellationToken::new();
     let mut stream = client
         .stream(request(), cancellation.clone())
@@ -215,5 +219,5 @@ async fn openai_client_cancellation_aborts_request() {
         .expect("stream should start");
 
     cancellation.cancel();
-    assert_eq!(stream.recv().await, Some(Err(LlmError::Cancelled)));
+    assert_eq!(stream.recv().await, Some(Err(ProviderError::Cancelled)));
 }

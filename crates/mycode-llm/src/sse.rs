@@ -14,19 +14,22 @@ impl SseParser {
         Self::default()
     }
 
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, crate::events::LlmError> {
+    pub fn push_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Vec<SseEvent>, crate::events::ProviderError> {
         self.buffer.extend_from_slice(bytes);
         self.take_complete_events()
     }
 
-    pub fn finish(&mut self) -> Result<Vec<SseEvent>, crate::events::LlmError> {
+    pub fn finish(&mut self) -> Result<Vec<SseEvent>, crate::events::ProviderError> {
         let events = self.take_complete_events()?;
         if self.buffer.is_empty() {
             return Ok(events);
         }
 
         let remainder = String::from_utf8(std::mem::take(&mut self.buffer)).map_err(|error| {
-            crate::events::LlmError::InvalidResponse {
+            crate::events::ProviderError::InvalidResponse {
                 message: format!("provider sent invalid UTF-8 SSE data: {error}"),
             }
         })?;
@@ -37,13 +40,13 @@ impl SseParser {
         Ok(result)
     }
 
-    fn take_complete_events(&mut self) -> Result<Vec<SseEvent>, crate::events::LlmError> {
+    fn take_complete_events(&mut self) -> Result<Vec<SseEvent>, crate::events::ProviderError> {
         let mut events = Vec::new();
         while let Some((start, length)) = find_event_separator(&self.buffer) {
             let event_bytes = self.buffer.drain(..start).collect::<Vec<_>>();
             self.buffer.drain(..length);
             let text = String::from_utf8(event_bytes).map_err(|error| {
-                crate::events::LlmError::InvalidResponse {
+                crate::events::ProviderError::InvalidResponse {
                     message: format!("provider sent invalid UTF-8 SSE data: {error}"),
                 }
             })?;

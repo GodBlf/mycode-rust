@@ -3,7 +3,7 @@ mod support;
 use mycode_core::config::{ProviderConfig, ProviderProtocol};
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
 use mycode_llm::{
-    LlmClient, LlmError, LlmEvent, OpenAiCompatClient, StopReason, ToolDefinition, Usage,
+    LlmClient, OpenAiCompatClient, ProviderError, ProviderEvent, StopReason, ToolDefinition, Usage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -20,7 +20,7 @@ fn provider(base_url: String) -> ProviderConfig {
     }
 }
 
-fn request() -> mycode_llm::LlmRequest {
+fn request() -> mycode_llm::ProviderRequest {
     let mut conversation = Conversation::new();
     conversation.push(ConversationMessage {
         role: MessageRole::User,
@@ -35,6 +35,7 @@ fn request() -> mycode_llm::LlmRequest {
             ContentBlock::Thinking {
                 thinking: "unsupported in chat completions".into(),
                 signature: "signature".into(),
+                encrypted_content: String::new(),
             },
             ContentBlock::Text {
                 text: "I will read it".into(),
@@ -57,7 +58,7 @@ fn request() -> mycode_llm::LlmRequest {
         timestamp_unix_seconds: 3,
     });
 
-    mycode_llm::LlmRequest {
+    mycode_llm::ProviderRequest {
         system_prompt: "be concise".into(),
         conversation,
         tools: vec![ToolDefinition {
@@ -81,10 +82,10 @@ async fn openai_compat_client_builds_requests_and_assembles_tool_calls() {
         r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-3","function":{"name":"search","arguments":"{\"query\":\"docs\"}"}}]}}]}"#,
         r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
         r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":20}}}"#,
+        "[DONE]",
     ]);
     let (base_url, request_receiver) = support::serve_once(response).await;
-    let client = OpenAiCompatClient::new(&provider(base_url), "be concise")
-        .expect("client should construct");
+    let client = OpenAiCompatClient::new(&provider(base_url)).expect("client should construct");
 
     let mut stream = client
         .stream(request(), CancellationToken::new())
@@ -98,37 +99,37 @@ async fn openai_compat_client_builds_requests_and_assembles_tool_calls() {
     assert_eq!(
         events,
         vec![
-            LlmEvent::TextDelta {
+            ProviderEvent::TextDelta {
                 text: "hello".into()
             },
-            LlmEvent::ToolCallStart {
+            ProviderEvent::ToolCallStart {
                 tool_id: "call-2".into(),
                 tool_name: "read_file".into()
             },
-            LlmEvent::ToolCallDelta {
+            ProviderEvent::ToolCallDelta {
                 text: "{\"path\":".into()
             },
-            LlmEvent::ToolCallDelta {
+            ProviderEvent::ToolCallDelta {
                 text: "\"README.md\"}".into()
             },
-            LlmEvent::ToolCallStart {
+            ProviderEvent::ToolCallStart {
                 tool_id: "call-3".into(),
                 tool_name: "search".into()
             },
-            LlmEvent::ToolCallDelta {
+            ProviderEvent::ToolCallDelta {
                 text: "{\"query\":\"docs\"}".into()
             },
-            LlmEvent::ToolCallComplete {
+            ProviderEvent::ToolCallComplete {
                 tool_id: "call-2".into(),
                 tool_name: "read_file".into(),
                 arguments: serde_json::json!({"path": "README.md"}),
             },
-            LlmEvent::ToolCallComplete {
+            ProviderEvent::ToolCallComplete {
                 tool_id: "call-3".into(),
                 tool_name: "search".into(),
                 arguments: serde_json::json!({"query": "docs"}),
             },
-            LlmEvent::StreamEnd {
+            ProviderEvent::StreamEnd {
                 stop_reason: StopReason::ToolUse,
                 usage: Usage {
                     input_tokens: 100,
@@ -187,8 +188,7 @@ async fn openai_compat_client_maps_context_length_errors() {
         r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#,
     );
     let (base_url, _request) = support::serve_once(response).await;
-    let client =
-        OpenAiCompatClient::new(&provider(base_url), "system").expect("client should construct");
+    let client = OpenAiCompatClient::new(&provider(base_url)).expect("client should construct");
 
     let mut stream = client
         .stream(request(), CancellationToken::new())
@@ -196,15 +196,14 @@ async fn openai_compat_client_maps_context_length_errors() {
         .expect("stream should start");
     assert!(matches!(
         stream.recv().await,
-        Some(Err(LlmError::ContextTooLong { .. }))
+        Some(Err(ProviderError::ContextTooLong { .. }))
     ));
 }
 
 #[tokio::test]
 async fn openai_compat_client_cancellation_aborts_request() {
     let base_url = support::serve_hanging().await;
-    let client =
-        OpenAiCompatClient::new(&provider(base_url), "system").expect("client should construct");
+    let client = OpenAiCompatClient::new(&provider(base_url)).expect("client should construct");
     let cancellation = CancellationToken::new();
     let mut stream = client
         .stream(request(), cancellation.clone())
@@ -212,5 +211,5 @@ async fn openai_compat_client_cancellation_aborts_request() {
         .expect("stream should start");
 
     cancellation.cancel();
-    assert_eq!(stream.recv().await, Some(Err(LlmError::Cancelled)));
+    assert_eq!(stream.recv().await, Some(Err(ProviderError::Cancelled)));
 }

@@ -3,28 +3,28 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{LlmClient, LlmRequest, LlmStream};
-use crate::events::{LlmError, LlmEvent};
+use crate::client::{LlmClient, ProviderRequest, ProviderStream};
+use crate::events::{ProviderError, ProviderEvent};
 
 #[derive(Debug, Default)]
 pub struct MockClient {
-    results: Vec<Result<LlmEvent, LlmError>>,
-    requests: Mutex<Vec<LlmRequest>>,
+    results: Vec<Result<ProviderEvent, ProviderError>>,
+    requests: Mutex<Vec<ProviderRequest>>,
 }
 
 impl MockClient {
-    pub fn new(events: Vec<LlmEvent>) -> Self {
+    pub fn new(events: Vec<ProviderEvent>) -> Self {
         Self::with_results(events.into_iter().map(Ok).collect())
     }
 
-    pub fn with_results(results: Vec<Result<LlmEvent, LlmError>>) -> Self {
+    pub fn with_results(results: Vec<Result<ProviderEvent, ProviderError>>) -> Self {
         Self {
             results,
             requests: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn requests(&self) -> Vec<LlmRequest> {
+    pub fn requests(&self) -> Vec<ProviderRequest> {
         self.requests
             .lock()
             .expect("mock request lock should not be poisoned")
@@ -38,9 +38,9 @@ impl MockClient {
 impl LlmClient for MockClient {
     async fn stream(
         &self,
-        request: LlmRequest,
+        request: ProviderRequest,
         cancellation: CancellationToken,
-    ) -> Result<LlmStream, LlmError> {
+    ) -> Result<ProviderStream, ProviderError> {
         self.requests
             .lock()
             .expect("mock request lock should not be poisoned")
@@ -50,13 +50,13 @@ impl LlmClient for MockClient {
         let results = self.results.clone();
         tokio::spawn(async move {
             if cancellation.is_cancelled() {
-                let _ = event_sender.send(Err(LlmError::Cancelled)).await;
+                let _ = event_sender.send(Err(ProviderError::Cancelled)).await;
                 return;
             }
             for result in results {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
-                        let _ = event_sender.send(Err(LlmError::Cancelled)).await;
+                        let _ = event_sender.send(Err(ProviderError::Cancelled)).await;
                         return;
                     }
                     sent = event_sender.send(result) => {

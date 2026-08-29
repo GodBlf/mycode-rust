@@ -4,12 +4,11 @@ use mycode_core::config::ProviderConfig;
 use mycode_core::conversation::{ContentBlock, ConversationMessage, MessageRole};
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{LlmClient, LlmRequest, LlmStream, ToolDefinition};
-use crate::events::{LlmError, LlmEvent, StopReason, Usage};
-use crate::http::{SseDecoder, run_sse_stream};
+use crate::client::{LlmClient, ProviderRequest, ProviderStream, ToolDefinition};
+use crate::events::{ProviderError, ProviderEvent, StopReason, Usage};
+use crate::http::{SseDecoder, spawn_sse_stream};
 use crate::limits::max_output_tokens;
 use crate::sse::SseEvent;
 
@@ -19,20 +18,16 @@ pub struct OpenAiCompatClient {
     api_key: String,
     base_url: String,
     model: String,
-    system_prompt: String,
     max_output_tokens: u64,
 }
 
 impl OpenAiCompatClient {
-    pub fn new(
-        provider: &ProviderConfig,
-        system_prompt: impl Into<String>,
-    ) -> Result<Self, LlmError> {
+    pub fn new(provider: &ProviderConfig) -> Result<Self, ProviderError> {
         let api_key =
             provider
                 .resolve_api_key_from_env()
                 .ok_or_else(|| {
-                    LlmError::Authentication {
+                    ProviderError::Authentication {
                 message:
                     "OpenAI-compatible API key not found; set provider api_key or OPENAI_API_KEY"
                         .into(),
@@ -44,14 +39,13 @@ impl OpenAiCompatClient {
             api_key,
             base_url: provider.base_url.trim_end_matches('/').to_string(),
             model: provider.model.clone(),
-            system_prompt: system_prompt.into(),
             max_output_tokens: max_output_tokens(provider),
         })
     }
 
-    fn request_body(&self, request: &LlmRequest) -> Value {
+    fn request_body(&self, request: &ProviderRequest) -> Value {
         let messages =
-            chat_completion_messages(&self.system_prompt, request.conversation.messages());
+            chat_completion_messages(&request.system_prompt, request.conversation.messages());
         let mut body = json!({
             "model": self.model,
             "max_tokens": self.max_output_tokens,
@@ -75,30 +69,23 @@ impl OpenAiCompatClient {
 impl LlmClient for OpenAiCompatClient {
     async fn stream(
         &self,
-        request: LlmRequest,
+        request: ProviderRequest,
         cancellation: CancellationToken,
-    ) -> Result<LlmStream, LlmError> {
+    ) -> Result<ProviderStream, ProviderError> {
         let body = self.request_body(&request);
         let endpoint = self.endpoint();
         let http = self.http.clone();
         let api_key = self.api_key.clone();
-        let (sender, receiver) = mpsc::channel(64);
         let state = ChatCompletionsStreamState::default();
 
-        tokio::spawn(async move {
-            run_sse_stream(
-                http,
-                endpoint,
-                vec![("authorization", format!("Bearer {api_key}"))],
-                body,
-                cancellation,
-                sender,
-                state,
-            )
-            .await;
-        });
-
-        Ok(receiver)
+        Ok(spawn_sse_stream(
+            http,
+            endpoint,
+            vec![("authorization", format!("Bearer {api_key}"))],
+            body,
+            cancellation,
+            state,
+        ))
     }
 }
 
@@ -220,9 +207,14 @@ struct ChatToolCall {
 }
 
 impl SseDecoder for ChatCompletionsStreamState {
-    fn decode(&mut self, event: &SseEvent) -> Result<Vec<LlmEvent>, LlmError> {
+    fn decode(&mut self, event: &SseEvent) -> Result<Vec<ProviderEvent>, ProviderError> {
+        if event.data.trim() == "[DONE]" {
+            self.ended = true;
+            return Ok(Vec::new());
+        }
+
         let data: Value =
-            serde_json::from_str(&event.data).map_err(|error| LlmError::InvalidResponse {
+            serde_json::from_str(&event.data).map_err(|error| ProviderError::InvalidResponse {
                 message: format!("invalid OpenAI-compatible SSE JSON: {error}"),
             })?;
         let mut events = Vec::new();
@@ -259,7 +251,7 @@ impl SseDecoder for ChatCompletionsStreamState {
         else {
             if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
                 self.ended = true;
-                events.push(LlmEvent::StreamEnd {
+                events.push(ProviderEvent::StreamEnd {
                     stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
                     usage: self.usage,
                 });
@@ -270,7 +262,7 @@ impl SseDecoder for ChatCompletionsStreamState {
         if let Some(content) = choice.pointer("/delta/content").and_then(Value::as_str)
             && !content.is_empty()
         {
-            events.push(LlmEvent::TextDelta {
+            events.push(ProviderEvent::TextDelta {
                 text: content.to_string(),
             });
         }
@@ -295,12 +287,12 @@ impl SseDecoder for ChatCompletionsStreamState {
                     Value::Object(serde_json::Map::new())
                 } else {
                     serde_json::from_str(&tool_call.arguments).map_err(|error| {
-                        LlmError::InvalidResponse {
+                        ProviderError::InvalidResponse {
                             message: format!("invalid OpenAI-compatible Tool arguments: {error}"),
                         }
                     })?
                 };
-                events.push(LlmEvent::ToolCallComplete {
+                events.push(ProviderEvent::ToolCallComplete {
                     tool_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
                     arguments,
@@ -311,12 +303,12 @@ impl SseDecoder for ChatCompletionsStreamState {
         Ok(events)
     }
 
-    fn finish(&mut self) -> Result<Vec<LlmEvent>, LlmError> {
+    fn finish(&mut self) -> Result<Vec<ProviderEvent>, ProviderError> {
         if self.ended {
             return Ok(Vec::new());
         }
         self.ended = true;
-        Ok(vec![LlmEvent::StreamEnd {
+        Ok(vec![ProviderEvent::StreamEnd {
             stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
             usage: self.usage,
         }])
@@ -327,12 +319,12 @@ impl ChatCompletionsStreamState {
     fn decode_tool_call(
         &mut self,
         tool_call: &Value,
-        events: &mut Vec<LlmEvent>,
-    ) -> Result<(), LlmError> {
+        events: &mut Vec<ProviderEvent>,
+    ) -> Result<(), ProviderError> {
         let index = tool_call
             .get("index")
             .and_then(Value::as_u64)
-            .ok_or_else(|| LlmError::InvalidResponse {
+            .ok_or_else(|| ProviderError::InvalidResponse {
                 message: "OpenAI-compatible tool call is missing index".into(),
             })?;
         let state = self.tool_calls.entry(index).or_default();
@@ -345,7 +337,7 @@ impl ChatCompletionsStreamState {
         }
         if !state.started && !state.name.is_empty() {
             state.started = true;
-            events.push(LlmEvent::ToolCallStart {
+            events.push(ProviderEvent::ToolCallStart {
                 tool_id: state.id.clone(),
                 tool_name: state.name.clone(),
             });
@@ -357,7 +349,7 @@ impl ChatCompletionsStreamState {
             && !arguments.is_empty()
         {
             state.arguments.push_str(arguments);
-            events.push(LlmEvent::ToolCallDelta {
+            events.push(ProviderEvent::ToolCallDelta {
                 text: arguments.to_string(),
             });
         }

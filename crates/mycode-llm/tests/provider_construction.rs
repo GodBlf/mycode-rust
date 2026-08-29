@@ -2,7 +2,7 @@ mod support;
 
 use mycode_core::config::{ProviderConfig, ProviderProtocol};
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
-use mycode_llm::{LlmError, build_provider_client, build_provider_client_with};
+use mycode_llm::{ProviderError, build_provider_client, build_provider_client_with};
 use tokio_util::sync::CancellationToken;
 
 fn provider(
@@ -25,7 +25,7 @@ fn provider(
     }
 }
 
-fn minimal_request() -> mycode_llm::LlmRequest {
+fn minimal_request() -> mycode_llm::ProviderRequest {
     let mut conversation = Conversation::new();
     conversation.push(ConversationMessage {
         role: MessageRole::User,
@@ -34,7 +34,7 @@ fn minimal_request() -> mycode_llm::LlmRequest {
         }],
         timestamp_unix_seconds: 1,
     });
-    mycode_llm::LlmRequest {
+    mycode_llm::ProviderRequest {
         system_prompt: "system".into(),
         conversation,
         tools: Vec::new(),
@@ -49,17 +49,14 @@ async fn anthropic_model_metadata_is_fetched_and_used() {
     ))
     .await;
 
-    let built = build_provider_client(
-        &provider(
-            ProviderProtocol::Anthropic,
-            base_url,
-            "claude-sonnet-4-6",
-            false,
-            None,
-            None,
-        ),
-        "system",
-    )
+    let built = build_provider_client(&provider(
+        ProviderProtocol::Anthropic,
+        base_url,
+        "claude-sonnet-4-6",
+        false,
+        None,
+        None,
+    ))
     .await
     .expect("provider should build");
 
@@ -89,7 +86,6 @@ async fn configured_api_key_takes_precedence_over_environment_lookup() {
             Some(128_000),
             None,
         ),
-        "system",
         |_| Some("environment-key".into()),
     )
     .await
@@ -112,17 +108,14 @@ async fn explicit_context_window_skips_anthropic_metadata_fetch() {
     let base_url = support::serve_hanging().await;
     let built = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        build_provider_client(
-            &provider(
-                ProviderProtocol::Anthropic,
-                base_url,
-                "claude-sonnet-4-6",
-                false,
-                Some(4_096),
-                None,
-            ),
-            "system",
-        ),
+        build_provider_client(&provider(
+            ProviderProtocol::Anthropic,
+            base_url,
+            "claude-sonnet-4-6",
+            false,
+            Some(4_096),
+            None,
+        )),
     )
     .await
     .expect("explicit context window should not fetch")
@@ -136,17 +129,14 @@ async fn anthropic_metadata_failure_falls_back_to_builtin_mapping() {
     let (base_url, _request) =
         support::serve_once(support::http_response(500, r#"{"error":"unavailable"}"#)).await;
 
-    let built = build_provider_client(
-        &provider(
-            ProviderProtocol::Anthropic,
-            base_url,
-            "claude-sonnet-4-6",
-            false,
-            None,
-            None,
-        ),
-        "system",
-    )
+    let built = build_provider_client(&provider(
+        ProviderProtocol::Anthropic,
+        base_url,
+        "claude-sonnet-4-6",
+        false,
+        None,
+        None,
+    ))
     .await
     .expect("provider should build despite metadata failure");
 
@@ -158,17 +148,14 @@ async fn non_anthropic_providers_do_not_fetch_model_metadata() {
     let base_url = support::serve_hanging().await;
     let built = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        build_provider_client(
-            &provider(
-                ProviderProtocol::OpenAi,
-                base_url,
-                "gpt-4.1",
-                false,
-                None,
-                None,
-            ),
-            "system",
-        ),
+        build_provider_client(&provider(
+            ProviderProtocol::OpenAi,
+            base_url,
+            "gpt-4.1",
+            false,
+            None,
+            None,
+        )),
     )
     .await
     .expect("OpenAI provider should not fetch Anthropic metadata")
@@ -180,33 +167,27 @@ async fn non_anthropic_providers_do_not_fetch_model_metadata() {
 
 #[tokio::test]
 async fn token_limits_use_explicit_and_thinking_defaults() {
-    let explicit = build_provider_client(
-        &provider(
-            ProviderProtocol::OpenAiCompat,
-            "https://provider.example.test".into(),
-            "unknown-model",
-            false,
-            Some(123_456),
-            Some(2_048),
-        ),
-        "system",
-    )
+    let explicit = build_provider_client(&provider(
+        ProviderProtocol::OpenAiCompat,
+        "https://provider.example.test".into(),
+        "unknown-model",
+        false,
+        Some(123_456),
+        Some(2_048),
+    ))
     .await
     .expect("provider should build");
     assert_eq!(explicit.context_window, 123_456);
     assert_eq!(explicit.max_output_tokens, 2_048);
 
-    let thinking = build_provider_client(
-        &provider(
-            ProviderProtocol::OpenAiCompat,
-            "https://provider.example.test".into(),
-            "unknown-model",
-            true,
-            None,
-            None,
-        ),
-        "system",
-    )
+    let thinking = build_provider_client(&provider(
+        ProviderProtocol::OpenAiCompat,
+        "https://provider.example.test".into(),
+        "unknown-model",
+        true,
+        None,
+        None,
+    ))
     .await
     .expect("provider should build");
     assert_eq!(thinking.context_window, 128_000);
@@ -230,9 +211,9 @@ async fn missing_api_keys_fail_before_requests() {
             None,
         );
         missing_key.api_key.clear();
-        let result = build_provider_client_with(&missing_key, "system", |_| None).await;
+        let result = build_provider_client_with(&missing_key, |_| None).await;
         assert!(
-            matches!(result, Err(LlmError::Authentication { .. })),
+            matches!(result, Err(ProviderError::Authentication { .. })),
             "protocol {protocol:?} should reject a missing API key"
         );
     }

@@ -4,12 +4,11 @@ use mycode_core::config::ProviderConfig;
 use mycode_core::conversation::{ContentBlock, ConversationMessage, MessageRole};
 use reqwest::Client;
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{LlmClient, LlmRequest, LlmStream, ToolDefinition};
-use crate::events::{LlmError, LlmEvent, StopReason, Usage};
-use crate::http::{SseDecoder, run_sse_stream};
+use crate::client::{LlmClient, ProviderRequest, ProviderStream, ToolDefinition};
+use crate::events::{ProviderError, ProviderEvent, StopReason, Usage};
+use crate::http::{SseDecoder, spawn_sse_stream};
 use crate::limits::max_output_tokens;
 use crate::sse::SseEvent;
 
@@ -20,19 +19,15 @@ pub struct AnthropicClient {
     base_url: String,
     model: String,
     thinking: bool,
-    system_prompt: String,
     max_output_tokens: u64,
 }
 
 impl AnthropicClient {
-    pub fn new(
-        provider: &ProviderConfig,
-        system_prompt: impl Into<String>,
-    ) -> Result<Self, LlmError> {
+    pub fn new(provider: &ProviderConfig) -> Result<Self, ProviderError> {
         let api_key =
             provider
                 .resolve_api_key_from_env()
-                .ok_or_else(|| LlmError::Authentication {
+                .ok_or_else(|| ProviderError::Authentication {
                     message:
                         "Anthropic API key not found; set provider api_key or ANTHROPIC_API_KEY"
                             .into(),
@@ -44,12 +39,11 @@ impl AnthropicClient {
             base_url: provider.base_url.trim_end_matches('/').to_string(),
             model: provider.model.clone(),
             thinking: provider.thinking,
-            system_prompt: system_prompt.into(),
             max_output_tokens: max_output_tokens(provider),
         })
     }
 
-    fn request_body(&self, request: &LlmRequest) -> Value {
+    fn request_body(&self, request: &ProviderRequest) -> Value {
         let mut messages = Vec::new();
         for message in request.conversation.messages() {
             append_anthropic_message(&mut messages, message);
@@ -61,7 +55,7 @@ impl AnthropicClient {
             "stream": true,
             "system": [{
                 "type": "text",
-                "text": self.system_prompt,
+                "text": request.system_prompt,
                 "cache_control": {"type": "ephemeral"}
             }],
             "messages": messages,
@@ -98,33 +92,26 @@ impl AnthropicClient {
 impl LlmClient for AnthropicClient {
     async fn stream(
         &self,
-        request: LlmRequest,
+        request: ProviderRequest,
         cancellation: CancellationToken,
-    ) -> Result<LlmStream, LlmError> {
+    ) -> Result<ProviderStream, ProviderError> {
         let body = self.request_body(&request);
         let http = self.http.clone();
         let api_key = self.api_key.clone();
         let endpoint = self.endpoint();
-        let (sender, receiver) = mpsc::channel(64);
         let state = AnthropicStreamState::default();
 
-        tokio::spawn(async move {
-            run_sse_stream(
-                http,
-                endpoint,
-                vec![
-                    ("x-api-key", api_key),
-                    ("anthropic-version", "2023-06-01".to_string()),
-                ],
-                body,
-                cancellation,
-                sender,
-                state,
-            )
-            .await;
-        });
-
-        Ok(receiver)
+        Ok(spawn_sse_stream(
+            http,
+            endpoint,
+            vec![
+                ("x-api-key", api_key),
+                ("anthropic-version", "2023-06-01".to_string()),
+            ],
+            body,
+            cancellation,
+            state,
+        ))
     }
 }
 
@@ -190,6 +177,7 @@ fn anthropic_content_block(block: &ContentBlock) -> Value {
         ContentBlock::Thinking {
             thinking,
             signature,
+            ..
         } => {
             json!({"type": "thinking", "thinking": thinking, "signature": signature})
         }
@@ -256,9 +244,9 @@ enum AnthropicBlockState {
 }
 
 impl SseDecoder for AnthropicStreamState {
-    fn decode(&mut self, event: &SseEvent) -> Result<Vec<LlmEvent>, LlmError> {
+    fn decode(&mut self, event: &SseEvent) -> Result<Vec<ProviderEvent>, ProviderError> {
         let data: Value =
-            serde_json::from_str(&event.data).map_err(|error| LlmError::InvalidResponse {
+            serde_json::from_str(&event.data).map_err(|error| ProviderError::InvalidResponse {
                 message: format!("invalid Anthropic SSE JSON: {error}"),
             })?;
         let event_type = data
@@ -319,7 +307,7 @@ impl SseDecoder for AnthropicStreamState {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 match delta_type {
-                    "text_delta" => Ok(vec![LlmEvent::TextDelta {
+                    "text_delta" => Ok(vec![ProviderEvent::TextDelta {
                         text: required_string(delta, "text")?,
                     }]),
                     "thinking_delta" => {
@@ -330,7 +318,7 @@ impl SseDecoder for AnthropicStreamState {
                         {
                             accumulated.push_str(&text);
                         }
-                        Ok(vec![LlmEvent::ThinkingDelta { text }])
+                        Ok(vec![ProviderEvent::ThinkingDelta { text }])
                     }
                     "signature_delta" => {
                         let signature = required_string(delta, "signature")?;
@@ -350,7 +338,7 @@ impl SseDecoder for AnthropicStreamState {
                         {
                             arguments.push_str(&text);
                         }
-                        Ok(vec![LlmEvent::ToolCallDelta { text }])
+                        Ok(vec![ProviderEvent::ToolCallDelta { text }])
                     }
                     _ => Ok(Vec::new()),
                 }
@@ -359,9 +347,10 @@ impl SseDecoder for AnthropicStreamState {
                 let index = required_u64(&data, "index")?;
                 match self.blocks.remove(&index) {
                     Some(AnthropicBlockState::Thinking { text, signature }) => {
-                        Ok(vec![LlmEvent::ThinkingComplete {
+                        Ok(vec![ProviderEvent::ThinkingComplete {
                             thinking: text,
                             signature,
+                            encrypted_content: String::new(),
                         }])
                     }
                     Some(AnthropicBlockState::ToolUse {
@@ -373,12 +362,12 @@ impl SseDecoder for AnthropicStreamState {
                             Value::Object(Map::new())
                         } else {
                             serde_json::from_str(&arguments).map_err(|error| {
-                                LlmError::InvalidResponse {
+                                ProviderError::InvalidResponse {
                                     message: format!("invalid Anthropic Tool arguments: {error}"),
                                 }
                             })?
                         };
-                        Ok(vec![LlmEvent::ToolCallComplete {
+                        Ok(vec![ProviderEvent::ToolCallComplete {
                             tool_id,
                             tool_name,
                             arguments,
@@ -400,7 +389,7 @@ impl SseDecoder for AnthropicStreamState {
                 }
                 Ok(Vec::new())
             }
-            "message_stop" => Ok(vec![LlmEvent::StreamEnd {
+            "message_stop" => Ok(vec![ProviderEvent::StreamEnd {
                 stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
                 usage: self.usage,
             }]),
@@ -409,7 +398,7 @@ impl SseDecoder for AnthropicStreamState {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown Anthropic stream error");
-                Err(LlmError::InvalidResponse {
+                Err(ProviderError::InvalidResponse {
                     message: message.to_string(),
                 })
             }
@@ -428,27 +417,27 @@ fn anthropic_stop_reason(value: &str) -> StopReason {
     }
 }
 
-fn required_string(object: &Value, field: &str) -> Result<String, LlmError> {
+fn required_string(object: &Value, field: &str) -> Result<String, ProviderError> {
     object
         .get(field)
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .ok_or_else(|| LlmError::InvalidResponse {
+        .ok_or_else(|| ProviderError::InvalidResponse {
             message: format!("Anthropic response is missing string field {field:?}"),
         })
 }
 
-fn required_u64(object: &Value, field: &str) -> Result<u64, LlmError> {
+fn required_u64(object: &Value, field: &str) -> Result<u64, ProviderError> {
     object
         .get(field)
         .and_then(Value::as_u64)
-        .ok_or_else(|| LlmError::InvalidResponse {
+        .ok_or_else(|| ProviderError::InvalidResponse {
             message: format!("Anthropic response is missing integer field {field:?}"),
         })
 }
 
-fn invalid_response() -> LlmError {
-    LlmError::InvalidResponse {
+fn invalid_response() -> ProviderError {
+    ProviderError::InvalidResponse {
         message: "Anthropic response was missing an expected field".into(),
     }
 }

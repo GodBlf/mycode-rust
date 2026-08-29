@@ -18,7 +18,7 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LlmEvent {
+pub enum ProviderEvent {
     TextDelta {
         text: String,
     },
@@ -28,6 +28,7 @@ pub enum LlmEvent {
     ThinkingComplete {
         thinking: String,
         signature: String,
+        encrypted_content: String,
     },
     ToolCallStart {
         tool_id: String,
@@ -48,7 +49,7 @@ pub enum LlmEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum LlmError {
+pub enum ProviderError {
     #[error("provider authentication failed: {message}")]
     Authentication { message: String },
     #[error("provider rate limit exceeded: {message}")]
