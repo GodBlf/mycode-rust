@@ -1,6 +1,7 @@
-[package]
-name = "mycode-rust"
+[workspace]
+members = ["crates/mycode-cli", "crates/mycode-core"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]

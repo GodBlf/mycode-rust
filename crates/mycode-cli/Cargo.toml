@@ -1,0 +1,8 @@
+[package]
+name = "mycode-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mycode"
+path = "src/main.rs"
