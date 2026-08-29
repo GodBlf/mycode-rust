@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::{
     context::{ToolContext, resolve_workspace_path},
-    tool::{Tool, ToolCategory, ToolResult},
+    tool::{PermissionSubject, Tool, ToolCategory, ToolResult},
 };
 
 #[derive(Debug, Deserialize)]
@@ -71,8 +71,11 @@ impl Tool for ReadFileTool {
         })
     }
 
-    fn permission_argument(&self, arguments: &Value) -> Option<String> {
-        arguments.get("file_path")?.as_str().map(str::to_string)
+    fn permission_subject(&self, arguments: &Value) -> Option<PermissionSubject> {
+        arguments
+            .get("file_path")?
+            .as_str()
+            .map(|path| PermissionSubject::Path(path.to_string()))
     }
 
     async fn execute(&self, context: &ToolContext, arguments: Value) -> ToolResult {
@@ -86,22 +89,19 @@ impl Tool for ReadFileTool {
             Ok(path) => path,
             Err(message) => return ToolResult::error(message),
         };
-        let contents = match std::fs::read(&path) {
-            Ok(contents) => contents,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+        let text = match crate::file_io::read_utf8(&path) {
+            Ok(text) => text,
+            Err(crate::file_io::FileReadError::NotFound) => {
                 return ToolResult::error(format!("file not found: {}", request.file_path));
             }
-            Err(source) => {
+            Err(crate::file_io::FileReadError::Io(source)) => {
                 return ToolResult::error(format!("failed to read {}: {source}", path.display()));
             }
-        };
-        let text = match String::from_utf8(contents.clone()) {
-            Ok(text) => text,
-            Err(_) => {
+            Err(crate::file_io::FileReadError::InvalidUtf8) => {
                 return ToolResult::error(format!("file is not UTF-8 text: {}", request.file_path));
             }
         };
-        if let Err(source) = context.file_state().record(&path, &contents) {
+        if let Err(source) = context.file_state().record(&path, text.as_bytes()) {
             return ToolResult::error(format!(
                 "failed to record file state for {}: {source}",
                 request.file_path

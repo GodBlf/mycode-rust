@@ -3,7 +3,7 @@ use std::sync::Arc;
 use mycode_tools::{
     context::ToolContext,
     registry::ToolRegistry,
-    tool::{Tool, ToolCategory, ToolResult},
+    tool::{PermissionSubject, Tool, ToolCategory, ToolResult},
     tool_search::ToolSearchTool,
 };
 use serde_json::{Value, json};
@@ -33,7 +33,7 @@ impl Tool for DeferredExampleTool {
         })
     }
 
-    fn permission_argument(&self, _arguments: &Value) -> Option<String> {
+    fn permission_subject(&self, _arguments: &Value) -> Option<PermissionSubject> {
         None
     }
 

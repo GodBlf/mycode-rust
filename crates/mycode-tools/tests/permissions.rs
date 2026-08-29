@@ -149,6 +149,54 @@ fn later_permission_rules_win_and_paths_stay_sandboxed() {
 }
 
 #[test]
+fn permission_rules_match_relevant_search_and_query_subjects() {
+    let rules = r#"
+- rule: "Glob(**/*.secret)"
+  effect: deny
+- rule: "Grep(password*)"
+  effect: deny
+- rule: "ToolSearch(select:*)"
+  effect: deny
+"#;
+    assert_eq!(
+        decision(
+            PermissionMode::BypassPermissions,
+            rules,
+            "Glob",
+            &json!({ "pattern": "**/*.secret", "path": "." })
+        ),
+        PermissionDecisionEffect::Deny
+    );
+    assert_eq!(
+        decision(
+            PermissionMode::BypassPermissions,
+            rules,
+            "Grep",
+            &json!({ "pattern": "password-secret", "path": "." })
+        ),
+        PermissionDecisionEffect::Deny
+    );
+    assert_eq!(
+        decision(
+            PermissionMode::Default,
+            rules,
+            "ToolSearch",
+            &json!({ "query": "select:SensitiveTool" })
+        ),
+        PermissionDecisionEffect::Deny
+    );
+    assert_eq!(
+        decision(
+            PermissionMode::Default,
+            rules,
+            "ToolSearch",
+            &json!({ "query": "../not-a-filesystem-path" })
+        ),
+        PermissionDecisionEffect::Allow
+    );
+}
+
+#[test]
 fn plan_file_exception_does_not_bypass_the_path_sandbox() {
     let work = tempfile::tempdir().expect("work tempdir");
     let outside = tempfile::tempdir().expect("outside tempdir");
@@ -188,6 +236,31 @@ fn dangerous_commands_are_denied_and_safe_commands_are_allowed() {
         ),
         PermissionDecisionEffect::Allow
     );
+}
+
+#[test]
+fn mutating_commands_with_safe_prefixes_are_not_auto_allowed() {
+    let cases = [
+        "env rm -rf .",
+        "git branch new-branch",
+        "git tag -d v1",
+        "git remote set-url origin https://example.invalid",
+        "go env -w GOOS=linux",
+        "git diff --output=changed.patch",
+    ];
+
+    for command in cases {
+        assert_eq!(
+            decision(
+                PermissionMode::Default,
+                "",
+                "Bash",
+                &json!({ "command": command })
+            ),
+            PermissionDecisionEffect::Ask,
+            "{command} should require confirmation"
+        );
+    }
 }
 
 #[test]

@@ -102,7 +102,7 @@ pub fn default_checker(
     let home_dir = home_dir.as_ref();
     let work_dir = work_dir.as_ref();
     let workspace = mycode_core::workspace::WorkspacePaths::new(work_dir);
-    let user_rules = home_dir.join(".mycode/permissions.yaml");
+    let user_rules = mycode_core::workspace::WorkspacePaths::home_permissions_file(home_dir);
     let project_rules = workspace.permissions_file();
     let local_rules = workspace.local_permissions_file();
     let rules = PermissionRuleEngine::from_paths([&user_rules, &project_rules, &local_rules])?;

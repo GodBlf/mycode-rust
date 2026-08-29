@@ -4,7 +4,7 @@ use mycode_core::config::Config;
 use mycode_tools::{
     context::ToolContext,
     runtime::{ToolExecutor, default_checker, default_registry},
-    tool::{Tool, ToolCategory, ToolResult},
+    tool::{PermissionSubject, Tool, ToolCategory, ToolResult},
 };
 use serde_json::{Value, json};
 
@@ -33,7 +33,7 @@ impl Tool for DeferredIntegrationTool {
         })
     }
 
-    fn permission_argument(&self, _arguments: &Value) -> Option<String> {
+    fn permission_subject(&self, _arguments: &Value) -> Option<PermissionSubject> {
         None
     }
 

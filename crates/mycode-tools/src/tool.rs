@@ -15,6 +15,26 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionSubject {
+    Command(String),
+    Path(String),
+    Search {
+        pattern: String,
+        path: Option<String>,
+    },
+    Query(String),
+}
+
+impl PermissionSubject {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Command(value) | Self::Path(value) | Self::Query(value) => value,
+            Self::Search { pattern, .. } => pattern,
+        }
+    }
+}
+
 impl ToolResult {
     pub fn success(output: impl Into<String>) -> Self {
         Self {
@@ -41,7 +61,7 @@ pub trait Tool: Send + Sync {
 
     fn schema(&self) -> Value;
 
-    fn permission_argument(&self, arguments: &Value) -> Option<String>;
+    fn permission_subject(&self, arguments: &Value) -> Option<PermissionSubject>;
 
     fn is_deferred(&self) -> bool {
         false

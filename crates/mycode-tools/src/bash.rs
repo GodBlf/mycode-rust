@@ -6,6 +6,7 @@ use tokio::process::Command;
 
 use crate::{
     context::ToolContext,
+    tool::PermissionSubject,
     tool::{Tool, ToolCategory, ToolResult},
 };
 
@@ -70,8 +71,11 @@ impl Tool for BashTool {
         })
     }
 
-    fn permission_argument(&self, arguments: &Value) -> Option<String> {
-        arguments.get("command")?.as_str().map(str::to_string)
+    fn permission_subject(&self, arguments: &Value) -> Option<PermissionSubject> {
+        arguments
+            .get("command")?
+            .as_str()
+            .map(|command| PermissionSubject::Command(command.to_string()))
     }
 
     async fn execute(&self, context: &ToolContext, arguments: Value) -> ToolResult {

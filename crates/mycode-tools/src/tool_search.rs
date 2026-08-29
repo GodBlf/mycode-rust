@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use crate::{
     context::ToolContext,
     registry::ToolRegistry,
+    tool::PermissionSubject,
     tool::{Tool, ToolCategory, ToolResult},
 };
 
@@ -66,8 +67,11 @@ impl Tool for ToolSearchTool {
         })
     }
 
-    fn permission_argument(&self, arguments: &Value) -> Option<String> {
-        arguments.get("query")?.as_str().map(str::to_string)
+    fn permission_subject(&self, arguments: &Value) -> Option<PermissionSubject> {
+        arguments
+            .get("query")?
+            .as_str()
+            .map(|query| PermissionSubject::Query(query.to_string()))
     }
 
     async fn execute(&self, _context: &ToolContext, arguments: Value) -> ToolResult {

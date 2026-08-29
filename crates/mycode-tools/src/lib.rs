@@ -2,6 +2,7 @@ pub mod bash;
 pub mod context;
 pub mod edit_file;
 pub mod file_history;
+pub mod file_io;
 pub mod file_state;
 pub mod glob;
 pub mod grep;

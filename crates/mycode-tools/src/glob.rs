@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use crate::{
     context::{ToolContext, resolve_workspace_path},
     search::walk_files,
+    tool::PermissionSubject,
     tool::{Tool, ToolCategory, ToolResult},
 };
 
@@ -74,12 +75,17 @@ impl Tool for GlobTool {
         })
     }
 
-    fn permission_argument(&self, arguments: &Value) -> Option<String> {
+    fn permission_subject(&self, arguments: &Value) -> Option<PermissionSubject> {
         arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .or(Some("."))
-            .map(str::to_string)
+            .get("pattern")?
+            .as_str()
+            .map(|pattern| PermissionSubject::Search {
+                pattern: pattern.to_string(),
+                path: arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
     }
 
     async fn execute(&self, context: &ToolContext, arguments: Value) -> ToolResult {

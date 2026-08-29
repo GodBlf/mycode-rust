@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 
 use crate::{
     context::{ToolContext, resolve_workspace_path},
+    tool::PermissionSubject,
     tool::{Tool, ToolCategory, ToolResult},
 };
 
@@ -62,8 +63,11 @@ impl Tool for WriteFileTool {
         })
     }
 
-    fn permission_argument(&self, arguments: &Value) -> Option<String> {
-        arguments.get("file_path")?.as_str().map(str::to_string)
+    fn permission_subject(&self, arguments: &Value) -> Option<PermissionSubject> {
+        arguments
+            .get("file_path")?
+            .as_str()
+            .map(|path| PermissionSubject::Path(path.to_string()))
     }
 
     async fn execute(&self, context: &ToolContext, arguments: Value) -> ToolResult {

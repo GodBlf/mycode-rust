@@ -19,6 +19,10 @@ impl WorkspacePaths {
         home_dir.join(".mycode/config.yaml")
     }
 
+    pub fn home_permissions_file(home_dir: &Path) -> PathBuf {
+        home_dir.join(".mycode/permissions.yaml")
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.work_dir.join(".mycode/config.yaml")
     }
