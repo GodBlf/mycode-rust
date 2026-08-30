@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/mycode-agent",
     "crates/mycode-cli",
     "crates/mycode-core",
     "crates/mycode-llm",

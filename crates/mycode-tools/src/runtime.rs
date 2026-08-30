@@ -8,7 +8,9 @@ use crate::{
     edit_file::EditFileTool,
     glob::GlobTool,
     grep::GrepTool,
-    permission::{PermissionChecker, PermissionRuleEngine},
+    permission::{
+        PermissionChecker, PermissionDecision, PermissionDecisionEffect, PermissionRuleEngine,
+    },
     read_file::ReadFileTool,
     registry::ToolRegistry,
     tool::ToolResult,
@@ -63,7 +65,7 @@ impl ToolExecutor {
         &self,
         tool_name: &str,
         arguments: &serde_json::Value,
-    ) -> Option<crate::permission::PermissionDecision> {
+    ) -> Option<PermissionDecision> {
         self.registry
             .get(tool_name)
             .map(|tool| self.checker.decision(tool.as_ref(), arguments))
@@ -75,22 +77,40 @@ impl ToolExecutor {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> ToolResult {
-        let Some(tool) = self.registry.get(tool_name) else {
+        let Some(tool) = self.lookup_tool(tool_name) else {
             return ToolResult::error(format!("unknown tool: {tool_name}"));
         };
         let decision = self.checker.decision(tool.as_ref(), &arguments);
         match decision.effect {
-            crate::permission::PermissionDecisionEffect::Allow => {
-                tool.execute(context, arguments).await
-            }
-            crate::permission::PermissionDecisionEffect::Deny => {
+            PermissionDecisionEffect::Allow => tool.execute(context, arguments).await,
+            PermissionDecisionEffect::Deny => {
                 ToolResult::error(format!("tool denied: {}", decision.reason))
             }
-            crate::permission::PermissionDecisionEffect::Ask => ToolResult::error(format!(
+            PermissionDecisionEffect::Ask => ToolResult::error(format!(
                 "tool requires user confirmation: {}",
                 decision.reason
             )),
         }
+    }
+
+    pub async fn execute_authorized(
+        &self,
+        context: &ToolContext,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        authorization: PermissionDecision,
+    ) -> ToolResult {
+        if authorization.effect != PermissionDecisionEffect::Allow {
+            return ToolResult::error(format!("tool not authorized: {}", authorization.reason));
+        }
+        let Some(tool) = self.lookup_tool(tool_name) else {
+            return ToolResult::error(format!("unknown tool: {tool_name}"));
+        };
+        tool.execute(context, arguments).await
+    }
+
+    fn lookup_tool(&self, tool_name: &str) -> Option<Arc<dyn crate::tool::Tool>> {
+        self.registry.get(tool_name)
     }
 }
 

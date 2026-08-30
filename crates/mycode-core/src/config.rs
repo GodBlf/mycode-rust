@@ -45,6 +45,22 @@ pub enum PermissionMode {
     BypassPermissions,
 }
 
+impl PermissionMode {
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "default" => Ok(Self::Default),
+            "acceptEdits" => Ok(Self::AcceptEdits),
+            "plan" => Ok(Self::Plan),
+            "bypassPermissions" => Ok(Self::BypassPermissions),
+            value => Err(ConfigError::Validation {
+                message: format!(
+                    "invalid permission_mode {value:?}; expected default, acceptEdits, plan, or bypassPermissions"
+                ),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderProtocol {
     #[serde(rename = "anthropic")]
@@ -270,6 +286,12 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn load_file(path: &Path) -> Result<Self, ConfigError> {
+        let config = read_document(path)?.into_config()?;
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn load(home_dir: &Path, work_dir: &Path) -> Result<Self, ConfigError> {
         let workspace = WorkspacePaths::new(work_dir);
         let paths = vec![
@@ -538,15 +560,7 @@ fn parse_provider_protocol(value: &str, index: usize) -> Result<ProviderProtocol
 fn parse_permission_mode(value: Option<&str>) -> Result<PermissionMode, ConfigError> {
     match value {
         None => Ok(PermissionMode::Default),
-        Some("default") => Ok(PermissionMode::Default),
-        Some("acceptEdits") => Ok(PermissionMode::AcceptEdits),
-        Some("plan") => Ok(PermissionMode::Plan),
-        Some("bypassPermissions") => Ok(PermissionMode::BypassPermissions),
-        Some(value) => Err(ConfigError::Validation {
-            message: format!(
-                "invalid permission_mode {value:?}; expected default, acceptEdits, plan, or bypassPermissions"
-            ),
-        }),
+        Some(value) => PermissionMode::parse(value),
     }
 }
 
