@@ -1,3 +1,4 @@
+use compaction::{compact_conversation, current_timestamp};
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
 use mycode_core::session::{SessionId, SessionStore};
 use mycode_llm::{LlmClient, ProviderError, ProviderEvent, ProviderRequest, ToolDefinition};
@@ -10,12 +11,19 @@ use tokio::sync::mpsc;
 
 use tools::{PendingToolCall, PermissionResponse, authorize_tool, execute_plan};
 
+mod compaction;
 mod config;
 mod events;
+pub mod tool_result;
 mod tools;
 
+pub use compaction::{
+    CompactionConfig, CompactionError, CompactionOutcome, CompactionTracker, CompactionTrigger,
+    RecoveryState,
+};
 pub use config::AgentConfig;
 pub use events::AgentEvent;
+pub use tool_result::{ToolResultBudget, ToolResultBudgetConfig, ToolResultBudgetError};
 
 pub struct Agent {
     provider: Box<dyn LlmClient>,
@@ -63,6 +71,32 @@ impl Agent {
         }
     }
 
+    pub async fn compact(&self) -> Result<CompactionOutcome, CompactionError> {
+        let messages = self
+            .session_store
+            .load(&self.session_id)?
+            .ok_or(CompactionError::SessionMissing)?;
+        let mut conversation = Conversation::new();
+        for message in messages {
+            conversation.push(message);
+        }
+        compact_conversation(
+            self.provider.as_ref(),
+            compaction::CompactionTarget {
+                session_store: &self.session_store,
+                session_id: &self.session_id,
+            },
+            &conversation,
+            &self.config.compaction,
+            compaction::CompactionAttachments {
+                cancellation: self.context.cancellation().clone(),
+                recovery: None,
+                tools: &[],
+            },
+        )
+        .await
+    }
+
     async fn run_inner(
         self,
         prompt: String,
@@ -95,6 +129,23 @@ impl Agent {
                 return;
             }
         };
+
+        let mut tool_result_budget = match ToolResultBudget::resume(
+            context.workspace_root(),
+            session_id.as_str(),
+            config.tool_result_budget,
+        ) {
+            Ok(budget) => budget,
+            Err(error) => {
+                let _ = event_sender
+                    .send(AgentEvent::RunError {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        tool_result_budget.reconstruct(&conversation);
 
         conversation.push(ConversationMessage {
             role: MessageRole::User,
@@ -138,12 +189,57 @@ impl Agent {
                     .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
             })
             .collect();
+        let mut compaction_tracker = CompactionTracker::default();
+        let mut recovery_state = RecoveryState::default();
         let mut iteration = 0;
         loop {
             iteration += 1;
+            let trigger =
+                compaction_tracker.should_compact(conversation.messages(), &config.compaction);
+            if trigger != compaction::CompactionTrigger::None {
+                match compact_conversation(
+                    provider.as_ref(),
+                    compaction::CompactionTarget {
+                        session_store: &session_store,
+                        session_id: &session_id,
+                    },
+                    &conversation,
+                    &config.compaction,
+                    compaction::CompactionAttachments {
+                        cancellation: context.cancellation().clone(),
+                        recovery: Some(&recovery_state),
+                        tools: &tools,
+                    },
+                )
+                .await
+                {
+                    Ok(outcome) if !outcome.summary.is_empty() => {
+                        conversation = outcome.compacted_conversation;
+                        compaction_tracker.reset_after_compaction();
+                        let event = AgentEvent::Compacted {
+                            message: format!(
+                                "Compacted: {} → {} estimated tokens",
+                                outcome.estimated_tokens_before, outcome.estimated_tokens_after
+                            ),
+                        };
+                        if event_sender.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if trigger == compaction::CompactionTrigger::Hard {
+                            send_run_error(&event_sender, error.to_string()).await;
+                            return;
+                        }
+                        compaction_tracker.record_auto_failure(&config.compaction);
+                    }
+                }
+            }
+
             let request = ProviderRequest {
                 system_prompt: config.system_prompt.clone(),
-                conversation: conversation.clone(),
+                conversation: tool_result_budget.apply(&conversation),
                 tools: tools.clone(),
             };
             let mut provider_stream = match provider
@@ -159,6 +255,7 @@ impl Agent {
 
             let mut text = String::new();
             let mut tool_calls: Vec<PendingToolCall> = Vec::new();
+            let mut usage = None;
             while let Some(result) = provider_stream.recv().await {
                 match result {
                     Ok(ProviderEvent::TextDelta { text: delta }) => {
@@ -193,7 +290,12 @@ impl Agent {
                             return;
                         }
                     }
-                    Ok(ProviderEvent::StreamEnd { .. }) => break,
+                    Ok(ProviderEvent::StreamEnd {
+                        usage: reported, ..
+                    }) => {
+                        usage = Some(reported);
+                        break;
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         send_provider_error(&event_sender, error).await;
@@ -223,6 +325,9 @@ impl Agent {
                 return;
             }
             conversation.push(assistant_message);
+            if let Some(usage) = usage {
+                compaction_tracker.record_usage(usage, conversation.messages().len());
+            }
 
             if tool_calls.is_empty() {
                 let _ = event_sender
@@ -253,6 +358,7 @@ impl Agent {
                     (
                         plan.tool_call.tool_id.clone(),
                         plan.tool_call.tool_name.clone(),
+                        plan.tool_call.arguments.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -291,7 +397,14 @@ impl Agent {
                 let Some(result) = result else {
                     continue;
                 };
-                let (tool_id, tool_name) = tool_metadata[index].clone();
+                let (tool_id, tool_name, arguments) = tool_metadata[index].clone();
+                if tool_name == "ReadFile"
+                    && let Some(path) = arguments
+                        .get("file_path")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    recovery_state.record_file_read(path, &result.output);
+                }
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: tool_id.clone(),
                     content: result.output.clone(),
@@ -370,11 +483,4 @@ async fn send_provider_error(event_sender: &mpsc::Sender<AgentEvent>, error: Pro
         }
     };
     let _ = event_sender.send(event).await;
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
 }
