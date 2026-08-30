@@ -1,22 +1,18 @@
 [package]
-name = "mycode-cli"
+name = "mycode-agent"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "mycode"
-path = "src/main.rs"
-
 [dependencies]
-home = "0.5"
-mycode-agent = { path = "../mycode-agent" }
+async-trait = "0.1"
+futures-util = "0.3"
 mycode-core = { path = "../mycode-core" }
 mycode-llm = { path = "../mycode-llm" }
 mycode-tools = { path = "../mycode-tools" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }

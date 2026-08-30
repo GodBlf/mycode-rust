@@ -26,6 +26,8 @@ pub enum ContentBlock {
     Thinking {
         thinking: String,
         signature: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        encrypted_content: String,
     },
     ToolUse {
         tool_use_id: String,

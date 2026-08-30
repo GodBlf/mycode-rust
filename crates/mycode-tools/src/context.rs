@@ -54,6 +54,16 @@ impl ToolContext {
         })
     }
 
+    pub fn with_cancellation(
+        work_dir: impl AsRef<Path>,
+        session_id: impl AsRef<str>,
+        cancellation: CancellationToken,
+    ) -> Result<Self, ToolContextError> {
+        let mut context = Self::new(work_dir, session_id)?;
+        context.cancellation = cancellation;
+        Ok(context)
+    }
+
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
