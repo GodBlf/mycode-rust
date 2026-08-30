@@ -148,6 +148,10 @@ async fn anthropic_client_builds_requests_and_decodes_streaming_events() {
                 signature: "signature".into(),
                 encrypted_content: String::new()
             },
+            ProviderEvent::ToolCallStart {
+                tool_id: "call-2".into(),
+                tool_name: "read_file".into()
+            },
             ProviderEvent::ToolCallDelta {
                 text: "{\"path\":".into()
             },

@@ -296,8 +296,19 @@ impl SseDecoder for AnthropicStreamState {
                     },
                     _ => AnthropicBlockState::Text,
                 };
+                let events = if let AnthropicBlockState::ToolUse {
+                    tool_id, tool_name, ..
+                } = &state
+                {
+                    vec![ProviderEvent::ToolCallStart {
+                        tool_id: tool_id.clone(),
+                        tool_name: tool_name.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                };
                 self.blocks.insert(index, state);
-                Ok(Vec::new())
+                Ok(events)
             }
             "content_block_delta" => {
                 let index = required_u64(&data, "index")?;

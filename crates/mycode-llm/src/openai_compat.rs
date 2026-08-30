@@ -193,7 +193,7 @@ fn chat_completion_tool(tool: &ToolDefinition) -> Value {
 struct ChatCompletionsStreamState {
     usage: Usage,
     stop_reason: Option<StopReason>,
-    ended: bool,
+    stream_end_emitted: bool,
     tool_calls: BTreeMap<u64, ChatToolCall>,
 }
 
@@ -209,8 +209,7 @@ struct ChatToolCall {
 impl SseDecoder for ChatCompletionsStreamState {
     fn decode(&mut self, event: &SseEvent) -> Result<Vec<ProviderEvent>, ProviderError> {
         if event.data.trim() == "[DONE]" {
-            self.ended = true;
-            return Ok(Vec::new());
+            return Ok(self.stream_end());
         }
 
         let data: Value =
@@ -250,11 +249,7 @@ impl SseDecoder for ChatCompletionsStreamState {
             .and_then(|choices| choices.first())
         else {
             if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
-                self.ended = true;
-                events.push(ProviderEvent::StreamEnd {
-                    stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
-                    usage: self.usage,
-                });
+                events.extend(self.stream_end());
             }
             return Ok(events);
         };
@@ -304,18 +299,22 @@ impl SseDecoder for ChatCompletionsStreamState {
     }
 
     fn finish(&mut self) -> Result<Vec<ProviderEvent>, ProviderError> {
-        if self.ended {
-            return Ok(Vec::new());
-        }
-        self.ended = true;
-        Ok(vec![ProviderEvent::StreamEnd {
-            stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
-            usage: self.usage,
-        }])
+        Ok(self.stream_end())
     }
 }
 
 impl ChatCompletionsStreamState {
+    fn stream_end(&mut self) -> Vec<ProviderEvent> {
+        if self.stream_end_emitted {
+            return Vec::new();
+        }
+        self.stream_end_emitted = true;
+        vec![ProviderEvent::StreamEnd {
+            stop_reason: self.stop_reason.clone().unwrap_or(StopReason::EndTurn),
+            usage: self.usage,
+        }]
+    }
+
     fn decode_tool_call(
         &mut self,
         tool_call: &Value,

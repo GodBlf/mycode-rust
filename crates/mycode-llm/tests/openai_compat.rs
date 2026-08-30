@@ -80,8 +80,7 @@ async fn openai_compat_client_builds_requests_and_assembles_tool_calls() {
         r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-2","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
         r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"README.md\"}"}}]}}]}"#,
         r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-3","function":{"name":"search","arguments":"{\"query\":\"docs\"}"}}]}}]}"#,
-        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-        r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":20}}}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":120,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":20}}}"#,
         "[DONE]",
     ]);
     let (base_url, request_receiver) = support::serve_once(response).await;
