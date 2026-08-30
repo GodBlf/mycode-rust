@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use mycode_agent::{Agent, AgentConfig, AgentEvent};
-use mycode_core::config::{Config, PermissionMode, ProviderConfig};
+use mycode_core::config::{Config, PermissionMode};
 use mycode_core::session::{SessionId, SessionStore};
 use mycode_llm::build_provider_client;
 use mycode_tools::context::ToolContext;
@@ -54,7 +54,10 @@ async fn run(arguments: Vec<String>) -> Result<i32, String> {
 
     let config = Config::load_file(&config_path)
         .map_err(|error| format!("failed to load config: {error}"))?;
-    let provider = select_provider(&config, options.provider.as_deref())?;
+    let provider = config
+        .providers
+        .first()
+        .ok_or_else(|| "configuration has no providers".to_string())?;
     let permission_mode = match options.permission_mode.as_deref() {
         Some(value) => PermissionMode::parse(value).map_err(|error| error.to_string())?,
         None => config.permission_mode,
@@ -153,7 +156,6 @@ struct Options {
     headless: bool,
     config: Option<PathBuf>,
     session: Option<String>,
-    provider: Option<String>,
     permission_mode: Option<String>,
 }
 
@@ -169,9 +171,6 @@ fn parse_arguments(arguments: Vec<String>) -> Result<Options, String> {
             "--session" => {
                 options.session = Some(take_value(&mut iterator, "--session")?);
             }
-            "--provider" => {
-                options.provider = Some(take_value(&mut iterator, "--provider")?);
-            }
             "--permission-mode" => {
                 options.permission_mode = Some(take_value(&mut iterator, "--permission-mode")?);
             }
@@ -185,23 +184,6 @@ fn take_value(iterator: &mut impl Iterator<Item = String>, flag: &str) -> Result
     iterator
         .next()
         .ok_or_else(|| format!("{flag} requires a value"))
-}
-
-fn select_provider<'a>(
-    config: &'a Config,
-    provider_name: Option<&'a str>,
-) -> Result<&'a ProviderConfig, String> {
-    let Some(name) = provider_name else {
-        return config
-            .providers
-            .first()
-            .ok_or_else(|| "configuration has no providers".to_string());
-    };
-    config
-        .providers
-        .iter()
-        .find(|provider| provider.name == name)
-        .ok_or_else(|| format!("provider {name:?} is not configured"))
 }
 
 fn spawn_ctrl_c_handler(cancellation: CancellationToken) {
@@ -223,6 +205,5 @@ fn print_usage() {
     println!("      --headless                Run one headless Agent turn");
     println!("      --config <path>           Use an explicit configuration file");
     println!("      --session <id|new>        Load a Session or create a new one");
-    println!("      --provider <name>         Select a configured Provider");
     println!("      --permission-mode <mode>  Override the configured Permission mode");
 }

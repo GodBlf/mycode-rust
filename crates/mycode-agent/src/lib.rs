@@ -115,6 +115,15 @@ impl Agent {
             return;
         }
 
+        if config.max_iterations == 0 {
+            let _ = event_sender
+                .send(AgentEvent::MaxIterationsReached {
+                    limit: config.max_iterations,
+                })
+                .await;
+            return;
+        }
+
         let tools: Vec<ToolDefinition> = executor
             .registry()
             .list()
@@ -266,12 +275,14 @@ impl Agent {
                 let Some((index, result)) = next else {
                     break;
                 };
-                completed_results[index] = Some(result);
-                while !context.cancellation().is_cancelled()
-                    && executions.len() < config.tool_concurrency.max(1)
-                    && let Some((index, plan)) = pending_plans.pop_front()
-                {
-                    executions.push(execute_plan(&executor, &context, index, plan));
+                if !context.cancellation().is_cancelled() {
+                    completed_results[index] = Some(result);
+                    while !context.cancellation().is_cancelled()
+                        && executions.len() < config.tool_concurrency.max(1)
+                        && let Some((index, plan)) = pending_plans.pop_front()
+                    {
+                        executions.push(execute_plan(&executor, &context, index, plan));
+                    }
                 }
             }
 
@@ -300,7 +311,7 @@ impl Agent {
                 }
             }
 
-            if context.cancellation().is_cancelled() {
+            if tool_results.is_empty() && context.cancellation().is_cancelled() {
                 let _ = event_sender.send(AgentEvent::RunCancelled).await;
                 return;
             }
@@ -311,10 +322,19 @@ impl Agent {
                 timestamp_unix_seconds: current_timestamp(),
             };
             if let Err(error) = session_store.append(&session_id, &tool_result_message) {
-                send_run_error(&event_sender, error.to_string()).await;
+                if context.cancellation().is_cancelled() {
+                    let _ = event_sender.send(AgentEvent::RunCancelled).await;
+                } else {
+                    send_run_error(&event_sender, error.to_string()).await;
+                }
                 return;
             }
             conversation.push(tool_result_message);
+
+            if context.cancellation().is_cancelled() {
+                let _ = event_sender.send(AgentEvent::RunCancelled).await;
+                return;
+            }
 
             if iteration >= config.max_iterations {
                 let _ = event_sender

@@ -185,6 +185,40 @@ async fn reaching_max_iterations_reports_a_terminal_event_after_tool_results() {
     assert_eq!(messages[2].role, MessageRole::User);
 }
 
+#[tokio::test]
+async fn zero_iteration_limit_ends_before_calling_the_provider() {
+    let workspace = tempfile::tempdir().expect("workspace should create");
+    let provider = ScriptedProvider::new(vec![vec![
+        failing_tool_call(),
+        stream_end(StopReason::ToolUse),
+    ]]);
+    let (agent, provider_for_test) = build_agent(
+        workspace.path(),
+        provider,
+        AgentConfig {
+            max_iterations: 0,
+            ..AgentConfig::default()
+        },
+    )
+    .await;
+    let mut events = Vec::new();
+    let mut events_receiver = agent.run("do not start").events;
+    while let Some(event) = events_receiver.recv().await {
+        events.push(event);
+    }
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::MaxIterationsReached { limit: 0 })
+    );
+    assert!(provider_for_test.requests().is_empty());
+    let messages = SessionStore::new(workspace.path())
+        .load(&SessionId::new("session").unwrap())
+        .expect("session should load")
+        .expect("session should exist");
+    assert_eq!(messages.len(), 1);
+}
+
 async fn build_agent(
     work_dir: &std::path::Path,
     provider: ScriptedProvider,

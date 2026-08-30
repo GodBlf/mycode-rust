@@ -22,7 +22,7 @@ pub(crate) struct PendingToolCall {
 pub(crate) struct PlannedToolCall {
     pub(crate) tool_call: PendingToolCall,
     pub(crate) denial_reason: Option<String>,
-    pub(crate) authorization: Option<PermissionDecision>,
+    pub(crate) permission_decision: Option<PermissionDecision>,
 }
 
 pub(crate) async fn execute_plan(
@@ -34,15 +34,15 @@ pub(crate) async fn execute_plan(
     let result = if let Some(reason) = plan.denial_reason {
         ToolResult::error(reason)
     } else {
-        let authorization = plan
-            .authorization
-            .expect("authorized tool calls carry a Permission Decision");
+        let permission_decision = plan
+            .permission_decision
+            .expect("allowed tool calls carry a Permission Decision");
         executor
-            .execute_authorized(
+            .execute_with_permission_decision(
                 context,
                 &plan.tool_call.tool_name,
                 plan.tool_call.arguments,
-                authorization,
+                permission_decision,
             )
             .await
     };
@@ -60,7 +60,7 @@ pub(crate) async fn authorize_tool(
         return Some(PlannedToolCall {
             tool_call: tool_call.clone(),
             denial_reason: Some(format!("unknown tool: {}", tool_call.tool_name)),
-            authorization: None,
+            permission_decision: None,
         });
     }
     let decision = executor.permission_decision(&tool_call.tool_name, &tool_call.arguments);
@@ -68,10 +68,10 @@ pub(crate) async fn authorize_tool(
         return Some(PlannedToolCall {
             tool_call: tool_call.clone(),
             denial_reason: Some(format!("unknown tool: {}", tool_call.tool_name)),
-            authorization: None,
+            permission_decision: None,
         });
     };
-    let (denial_reason, authorization) = match decision.effect {
+    let (denial_reason, permission_decision) = match decision.effect {
         PermissionDecisionEffect::Allow => (None, Some(decision.clone())),
         PermissionDecisionEffect::Deny => (Some(format!("tool denied: {}", decision.reason)), None),
         PermissionDecisionEffect::Ask => {
@@ -88,7 +88,7 @@ pub(crate) async fn authorize_tool(
                 return Some(PlannedToolCall {
                     tool_call: tool_call.clone(),
                     denial_reason: Some("agent event stream closed".into()),
-                    authorization: None,
+                    permission_decision: None,
                 });
             }
             let allowed = loop {
@@ -129,6 +129,6 @@ pub(crate) async fn authorize_tool(
     Some(PlannedToolCall {
         tool_call: tool_call.clone(),
         denial_reason,
-        authorization,
+        permission_decision,
     })
 }

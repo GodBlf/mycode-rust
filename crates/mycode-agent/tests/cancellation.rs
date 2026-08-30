@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::{Arc, Mutex};
 
 use mycode_agent::{Agent, AgentConfig, AgentEvent};
@@ -253,6 +254,85 @@ async fn cancellation_after_a_completed_tool_result_persists_that_result() {
         &messages[2].content[0],
         ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-fast"
     ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_run_remains_cancelled_when_persisting_completed_results_fails() {
+    let workspace = tempfile::tempdir().expect("workspace should create");
+    let cancellation = CancellationToken::new();
+    let registry = ToolRegistry::new();
+    registry
+        .register(TestTool {
+            name: "Fast",
+            waits_for_cancellation: false,
+            log: ExecutionLog::default(),
+            started: None,
+        })
+        .expect("tool should register");
+    let (waiting_started_sender, mut waiting_started_receiver) = unbounded_channel();
+    registry
+        .register(TestTool {
+            name: "Waiting",
+            waits_for_cancellation: true,
+            log: ExecutionLog::default(),
+            started: Some(waiting_started_sender),
+        })
+        .expect("tool should register");
+    let provider = ScriptedProvider::new(vec![ProviderCall::Events(vec![
+        Ok(tool_call("call-fast", "Fast")),
+        Ok(tool_call("call-waiting", "Waiting")),
+        Ok(ProviderEvent::StreamEnd {
+            stop_reason: StopReason::ToolUse,
+            usage: Default::default(),
+        }),
+    ])]);
+    let checker = default_checker(
+        PermissionMode::BypassPermissions,
+        workspace.path(),
+        workspace.path(),
+    )
+    .expect("checker should create");
+    let context = ToolContext::with_cancellation(
+        workspace.path(),
+        "persist-failure-cancel-session",
+        cancellation.clone(),
+    )
+    .expect("context should create");
+    let agent = Agent::new(
+        Box::new(provider),
+        ToolExecutor::new(Arc::new(registry), checker),
+        context,
+        SessionStore::new(workspace.path()),
+        SessionId::new("persist-failure-cancel-session").unwrap(),
+        AgentConfig {
+            tool_concurrency: 2,
+            ..AgentConfig::default()
+        },
+    );
+
+    let mut events = Vec::new();
+    let mut run_events = agent.run("cancel with a persistence failure").events;
+    let collection = tokio::spawn(async move {
+        while let Some(event) = run_events.recv().await {
+            events.push(event);
+        }
+        events
+    });
+    waiting_started_receiver
+        .recv()
+        .await
+        .expect("waiting tool should start");
+
+    let session_path = workspace
+        .path()
+        .join(".mycode/sessions/persist-failure-cancel-session.jsonl");
+    fs::remove_file(&session_path).expect("session file should be removable");
+    fs::create_dir(&session_path).expect("session path should become a directory");
+    cancellation.cancel();
+
+    let events = collection.await.expect("event collection should finish");
+    assert_eq!(events.last(), Some(&AgentEvent::RunCancelled));
 }
 
 #[tokio::test]

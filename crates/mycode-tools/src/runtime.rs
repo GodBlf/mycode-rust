@@ -93,15 +93,18 @@ impl ToolExecutor {
         }
     }
 
-    pub async fn execute_authorized(
+    pub async fn execute_with_permission_decision(
         &self,
         context: &ToolContext,
         tool_name: &str,
         arguments: serde_json::Value,
-        authorization: PermissionDecision,
+        permission_decision: PermissionDecision,
     ) -> ToolResult {
-        if authorization.effect != PermissionDecisionEffect::Allow {
-            return ToolResult::error(format!("tool not authorized: {}", authorization.reason));
+        if permission_decision.effect != PermissionDecisionEffect::Allow {
+            return ToolResult::error(format!(
+                "tool Permission Decision is not allow: {}",
+                permission_decision.reason
+            ));
         }
         let Some(tool) = self.lookup_tool(tool_name) else {
             return ToolResult::error(format!("unknown tool: {tool_name}"));
