@@ -7,7 +7,7 @@ use std::{
 
 use mycode_core::{
     conversation::{ContentBlock, Conversation, ConversationMessage},
-    session::{SessionError, SessionId},
+    session::SessionId,
     workspace::WorkspacePaths,
 };
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,6 @@ impl Default for ToolResultBudgetConfig {
 
 #[derive(Debug, Error)]
 pub enum ToolResultBudgetError {
-    #[error(transparent)]
-    InvalidSessionId(#[from] SessionError),
     #[error("failed to read Tool Result replacement records")]
     ReadRecords(#[source] std::io::Error),
     #[error("invalid Tool Result replacement record at line {line_number}")]
@@ -46,9 +44,15 @@ pub enum ToolResultBudgetError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ReplacementRecordKind {
+    ToolResult,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ReplacementRecord {
-    kind: String,
+    kind: ReplacementRecordKind,
     tool_use_id: String,
     replacement: String,
 }
@@ -67,10 +71,9 @@ pub struct ToolResultBudget {
 impl ToolResultBudget {
     pub fn resume(
         work_dir: impl AsRef<Path>,
-        session_id: &str,
+        session_id: &SessionId,
         config: ToolResultBudgetConfig,
     ) -> Result<Self, ToolResultBudgetError> {
-        let session_id = SessionId::new(session_id)?;
         let workspace_root = work_dir.as_ref().to_path_buf();
         let paths = WorkspacePaths::new(&workspace_root);
         let records_path = paths
@@ -95,7 +98,7 @@ impl ToolResultBudget {
                             source,
                         }
                     })?;
-                if record.kind == "tool-result" {
+                if record.kind == ReplacementRecordKind::ToolResult {
                     persisted_replacements.insert(record.tool_use_id.clone());
                     replacements.insert(record.tool_use_id, record.replacement);
                 }
@@ -377,7 +380,7 @@ impl ToolResultBudget {
             .iter()
             .filter(|(tool_use_id, _)| !self.persisted_replacements.contains(*tool_use_id))
             .map(|(tool_use_id, replacement)| ReplacementRecord {
-                kind: "tool-result".into(),
+                kind: ReplacementRecordKind::ToolResult,
                 tool_use_id: tool_use_id.clone(),
                 replacement: replacement.clone(),
             })

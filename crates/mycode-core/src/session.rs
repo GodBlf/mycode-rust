@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::conversation::{ContentBlock, ConversationMessage, MessageRole, first_user_text};
+use crate::time::current_timestamp;
 use crate::workspace::{WorkspacePaths, unique_slug};
 
 #[derive(Debug, Error)]
@@ -109,9 +110,15 @@ enum SessionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompactBoundaryRecord {
     #[serde(rename = "type")]
-    record_type: String,
+    record_type: CompactBoundaryRecordKind,
     #[serde(flatten)]
     boundary: CompactBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CompactBoundaryRecordKind {
+    CompactBoundary,
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +184,7 @@ impl SessionStore {
             },
         )?;
         let record = CompactBoundaryRecord {
-            record_type: "compact_boundary".into(),
+            record_type: CompactBoundaryRecordKind::CompactBoundary,
             boundary: boundary.clone(),
         };
         let record = serde_json::to_string(&record).map_err(|source| SessionError::Serialize {
@@ -204,20 +211,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<Vec<ConversationMessage>>, SessionError> {
-        let path = self.session_path(session_id);
-        let file = File::open(&path).map_or_else(
-            |source| {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    Ok(None)
-                } else {
-                    Err(SessionError::Read {
-                        session_id: session_id.as_str().to_string(),
-                        source,
-                    })
-                }
-            },
-            |file| Ok(Some(file)),
-        )?;
+        let file = self.open_session_file_if_exists(session_id)?;
         let Some(file) = file else {
             return Ok(None);
         };
@@ -378,24 +372,25 @@ impl SessionStore {
         Path::new(&self.sessions_dir()).join(format!("{}.jsonl", session_id.as_str()))
     }
 
+    fn open_session_file_if_exists(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<File>, SessionError> {
+        match File::open(self.session_path(session_id)) {
+            Ok(file) => Ok(Some(file)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(SessionError::Read {
+                session_id: session_id.as_str().to_string(),
+                source,
+            }),
+        }
+    }
+
     fn load_message_records(
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ConversationMessage>, SessionError> {
-        let path = self.session_path(session_id);
-        let file = File::open(&path).map_or_else(
-            |source| {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    Ok(None)
-                } else {
-                    Err(SessionError::Read {
-                        session_id: session_id.as_str().to_string(),
-                        source,
-                    })
-                }
-            },
-            |file| Ok(Some(file)),
-        )?;
+        let file = self.open_session_file_if_exists(session_id)?;
         let Some(file) = file else {
             return Ok(Vec::new());
         };
@@ -405,13 +400,6 @@ impl SessionStore {
             .filter_map(SessionRecord::into_message)
             .collect())
     }
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
 }
 
 impl SessionRecord {

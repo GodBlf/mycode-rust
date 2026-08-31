@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use mycode_agent::{Agent, AgentConfig, CompactionConfig, CompactionTracker, CompactionTrigger};
+use mycode_agent::{
+    Agent, AgentConfig, CompactionConfig, CompactionTracker, CompactionTrigger, estimate_tokens,
+};
 use mycode_core::conversation::{ContentBlock, ConversationMessage, MessageRole};
 use mycode_core::session::{SessionId, SessionStore};
 use mycode_llm::{
@@ -148,7 +150,7 @@ async fn automatic_compaction_triggers_before_the_provider_call_and_persists_bou
     let config = AgentConfig {
         compaction: CompactionConfig {
             context_window_tokens: 100,
-            max_output_tokens: 0,
+            max_output_tokens: 5,
             auto_safety_margin_tokens: 0,
             manual_safety_margin_tokens: 0,
             recovery_token_budget: 1,
@@ -220,7 +222,7 @@ async fn automatic_compaction_recovery_includes_recent_file_read_and_tools() {
             ProviderEvent::StreamEnd {
                 stop_reason: StopReason::ToolUse,
                 usage: Usage {
-                    input_tokens: 100,
+                    input_tokens: 70,
                     output_tokens: 1,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
@@ -249,7 +251,7 @@ async fn automatic_compaction_recovery_includes_recent_file_read_and_tools() {
     let config = AgentConfig {
         compaction: CompactionConfig {
             context_window_tokens: 110,
-            max_output_tokens: 0,
+            max_output_tokens: 5,
             auto_safety_margin_tokens: 0,
             manual_safety_margin_tokens: 0,
             recovery_token_budget: 80,
@@ -277,6 +279,142 @@ async fn automatic_compaction_recovery_includes_recent_file_read_and_tools() {
     assert!(continuation.contains("recover this file content"));
     assert!(continuation.contains("Available tools:"));
     assert!(!continuation.contains(&"z".repeat(1_000)));
+}
+
+#[tokio::test]
+async fn soft_compaction_failures_are_circuit_broken_within_one_agent_run() {
+    let workspace = tempfile::tempdir().expect("workspace should create");
+    std::fs::write(workspace.path().join("notes.txt"), "content\n").expect("file should write");
+    let session_id = SessionId::new("circuit-breaker").expect("session ID should be valid");
+    SessionStore::new(workspace.path())
+        .append(
+            &session_id,
+            &ConversationMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "x".repeat(280),
+                }],
+                timestamp_unix_seconds: 42,
+            },
+        )
+        .expect("append initial message");
+
+    let read_file = || {
+        vec![
+            ProviderEvent::ToolCallComplete {
+                tool_id: format!("read-{}", uuid_like()),
+                tool_name: "ReadFile".into(),
+                arguments: serde_json::json!({"file_path": "notes.txt"}),
+            },
+            ProviderEvent::StreamEnd {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 70,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+            },
+        ]
+    };
+    let empty_summary = || {
+        vec![ProviderEvent::StreamEnd {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        }]
+    };
+    let final_stream = || {
+        vec![
+            ProviderEvent::TextDelta {
+                text: "done".into(),
+            },
+            ProviderEvent::StreamEnd {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            },
+        ]
+    };
+    let provider = SequenceMockClient::new(vec![
+        empty_summary(),
+        read_file(),
+        empty_summary(),
+        read_file(),
+        final_stream(),
+    ]);
+    let config = AgentConfig {
+        max_iterations: 4,
+        compaction: CompactionConfig {
+            context_window_tokens: 100,
+            max_output_tokens: 5,
+            auto_safety_margin_tokens: 20,
+            manual_safety_margin_tokens: 0,
+            max_consecutive_auto_failures: 2,
+            ..small_compaction_config()
+        },
+        ..AgentConfig::default()
+    };
+    let run = agent(workspace.path(), Arc::clone(&provider), session_id, config).run("continue");
+    let mut events = run.events;
+    while let Some(event) = events.recv().await {
+        assert!(
+            !matches!(event, mycode_agent::AgentEvent::RunError { .. }),
+            "circuit-broken run should finish: {event:?}"
+        );
+    }
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.system_prompt.contains("summaries"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn hard_threshold_compaction_failure_terminates_the_agent_run() {
+    let workspace = tempfile::tempdir().expect("workspace should create");
+    let session_id = SessionId::new("hard-threshold").expect("session ID should be valid");
+    SessionStore::new(workspace.path())
+        .append(
+            &session_id,
+            &ConversationMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "x".repeat(1_000),
+                }],
+                timestamp_unix_seconds: 42,
+            },
+        )
+        .expect("append initial message");
+    let provider = SequenceMockClient::new(vec![vec![ProviderEvent::StreamEnd {
+        stop_reason: StopReason::EndTurn,
+        usage: Default::default(),
+    }]]);
+    let config = AgentConfig {
+        compaction: CompactionConfig {
+            context_window_tokens: 100,
+            max_output_tokens: 5,
+            auto_safety_margin_tokens: 0,
+            manual_safety_margin_tokens: 0,
+            ..small_compaction_config()
+        },
+        ..AgentConfig::default()
+    };
+    let run = agent(workspace.path(), Arc::clone(&provider), session_id, config).run("continue");
+    let mut events = run.events;
+    let mut terminal = None;
+    while let Some(event) = events.recv().await {
+        terminal = Some(event);
+    }
+
+    assert!(matches!(
+        terminal,
+        Some(mycode_agent::AgentEvent::RunError { .. })
+    ));
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[test]
@@ -307,9 +445,9 @@ fn usage_anchor_and_failure_tracker_drive_thresholds() {
     );
     let config = CompactionConfig {
         context_window_tokens: 110,
-        max_output_tokens: 0,
+        max_output_tokens: 5,
         auto_safety_margin_tokens: 11,
-        manual_safety_margin_tokens: 9,
+        manual_safety_margin_tokens: 4,
         max_consecutive_auto_failures: 2,
         ..CompactionConfig::default()
     };
@@ -331,4 +469,59 @@ fn usage_anchor_and_failure_tracker_drive_thresholds() {
         tracker.should_compact(&messages, &config),
         CompactionTrigger::Soft
     );
+}
+
+#[test]
+fn zero_output_limit_still_reserves_summary_output() {
+    let tracker = CompactionTracker::default();
+    let messages = vec![ConversationMessage {
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(350),
+        }],
+        timestamp_unix_seconds: 42,
+    }];
+    let config = CompactionConfig {
+        context_window_tokens: 110,
+        max_output_tokens: 0,
+        summary_output_reserve_tokens: 5,
+        auto_safety_margin_tokens: 11,
+        manual_safety_margin_tokens: 0,
+        max_consecutive_auto_failures: 2,
+        ..CompactionConfig::default()
+    };
+
+    assert_eq!(
+        tracker.should_compact(&messages, &config),
+        CompactionTrigger::Soft
+    );
+}
+
+#[test]
+fn token_estimation_uses_utf8_bytes_for_multibyte_text() {
+    let cjk = ConversationMessage {
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text {
+            text: "你好".into(),
+        }],
+        timestamp_unix_seconds: 42,
+    };
+    let ascii = ConversationMessage {
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text {
+            text: "abcdef".into(),
+        }],
+        timestamp_unix_seconds: 42,
+    };
+
+    assert_eq!(
+        estimate_tokens(std::slice::from_ref(&cjk)),
+        estimate_tokens(std::slice::from_ref(&ascii))
+    );
+}
+
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+    format!("read-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }

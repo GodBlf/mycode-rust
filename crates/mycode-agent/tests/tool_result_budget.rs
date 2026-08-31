@@ -1,5 +1,6 @@
 use mycode_agent::tool_result::{ToolResultBudget, ToolResultBudgetConfig};
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
+use mycode_core::session::SessionId;
 
 fn tool_result_message(results: Vec<ContentBlock>) -> ConversationMessage {
     ConversationMessage {
@@ -50,12 +51,16 @@ fn config() -> ToolResultBudgetConfig {
     }
 }
 
+fn session_id() -> SessionId {
+    SessionId::new("session").expect("session id should create")
+}
+
 #[test]
 fn single_large_tool_result_spills_and_stays_stable_after_restart() {
     let workspace = tempfile::tempdir().expect("workspace should create");
     let mut budget = ToolResultBudget::resume(
         workspace.path(),
-        "session",
+        &session_id(),
         ToolResultBudgetConfig {
             single_result_limit_chars: 5,
             message_aggregate_limit_chars: 200,
@@ -76,7 +81,7 @@ fn single_large_tool_result_spills_and_stays_stable_after_restart() {
 
     let mut restarted = ToolResultBudget::resume(
         workspace.path(),
-        "session",
+        &session_id(),
         ToolResultBudgetConfig {
             single_result_limit_chars: 5,
             message_aggregate_limit_chars: 200,
@@ -92,7 +97,7 @@ fn single_large_tool_result_spills_and_stays_stable_after_restart() {
 #[test]
 fn aggregate_budget_spills_largest_results_while_preserving_order() {
     let workspace = tempfile::tempdir().expect("workspace should create");
-    let mut budget = ToolResultBudget::resume(workspace.path(), "session", config())
+    let mut budget = ToolResultBudget::resume(workspace.path(), &session_id(), config())
         .expect("budget should resume");
     let mut conversation = Conversation::new();
     conversation.push(tool_result_message(vec![
@@ -127,7 +132,7 @@ fn aggregate_budget_spills_largest_results_while_preserving_order() {
 #[test]
 fn stale_tool_results_are_snipped_with_a_stable_preview() {
     let workspace = tempfile::tempdir().expect("workspace should create");
-    let mut budget = ToolResultBudget::resume(workspace.path(), "session", config())
+    let mut budget = ToolResultBudget::resume(workspace.path(), &session_id(), config())
         .expect("budget should resume");
     let mut conversation = Conversation::new();
     conversation.push(text_message(MessageRole::Assistant, "first turn"));
@@ -152,7 +157,7 @@ fn spill_readback_does_not_spill_again() {
     std::fs::write(&spill_path, "large readback").expect("write spill file");
     let mut budget = ToolResultBudget::resume(
         workspace.path(),
-        "session",
+        &session_id(),
         ToolResultBudgetConfig {
             single_result_limit_chars: 5,
             message_aggregate_limit_chars: 200,
@@ -188,7 +193,7 @@ fn failed_spill_freezes_the_original_result() {
     std::fs::create_dir_all(&spill_path).expect("block spill file with a directory");
     let mut budget = ToolResultBudget::resume(
         workspace.path(),
-        "session",
+        &session_id(),
         ToolResultBudgetConfig {
             single_result_limit_chars: 5,
             message_aggregate_limit_chars: 200,
@@ -222,12 +227,12 @@ fn restart_reconstructs_seen_but_unreplaced_results() {
     let mut conversation = Conversation::new();
     conversation.push(tool_result_message(vec![result("old", "o".repeat(1_000))]));
 
-    let mut first = ToolResultBudget::resume(workspace.path(), "session", config)
+    let mut first = ToolResultBudget::resume(workspace.path(), &session_id(), config)
         .expect("budget should resume");
     assert_eq!(first.apply(&conversation), conversation);
 
     conversation.push(tool_result_message(vec![result("new", "n".repeat(24_000))]));
-    let mut restarted = ToolResultBudget::resume(workspace.path(), "session", config)
+    let mut restarted = ToolResultBudget::resume(workspace.path(), &session_id(), config)
         .expect("budget should restart");
     restarted.reconstruct(&conversation);
     let resumed = restarted.apply(&conversation);

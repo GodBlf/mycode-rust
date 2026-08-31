@@ -1,8 +1,7 @@
-use std::collections::HashMap;
-
 use mycode_core::{
     conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole},
     session::{CompactBoundary, SessionError, SessionId, SessionStore},
+    time::current_timestamp,
 };
 use mycode_llm::{LlmClient, ProviderError, ProviderEvent, ProviderRequest, ToolDefinition, Usage};
 use thiserror::Error;
@@ -14,6 +13,7 @@ const SUMMARY_OUTPUT_RESERVE_TOKENS: usize = 20_000;
 const AUTO_COMPACT_SAFETY_MARGIN_TOKENS: usize = 13_000;
 const MANUAL_COMPACT_SAFETY_MARGIN_TOKENS: usize = 3_000;
 const MAX_CONSECUTIVE_AUTO_COMPACT_FAILURES: usize = 3;
+const RECENT_FILE_READ_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
@@ -116,11 +116,14 @@ impl CompactionTracker {
         config: &CompactionConfig,
     ) -> CompactionTrigger {
         let used_tokens = self.used_tokens(messages);
-        let effective_window = config.context_window_tokens.saturating_sub(
+        let output_reserve = if config.max_output_tokens == 0 {
+            config.summary_output_reserve_tokens
+        } else {
             config
                 .max_output_tokens
-                .min(config.summary_output_reserve_tokens),
-        );
+                .min(config.summary_output_reserve_tokens)
+        };
+        let effective_window = config.context_window_tokens.saturating_sub(output_reserve);
         let manual_threshold = effective_window.saturating_sub(config.manual_safety_margin_tokens);
         if used_tokens >= manual_threshold {
             return CompactionTrigger::Hard;
@@ -155,7 +158,13 @@ pub enum CompactionTrigger {
 
 #[derive(Debug, Default)]
 pub struct RecoveryState {
-    file_reads: HashMap<String, String>,
+    file_reads: Vec<FileReadRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileReadRecord {
+    path: String,
+    output: String,
 }
 
 pub(crate) struct CompactionTarget<'a> {
@@ -171,7 +180,15 @@ pub(crate) struct CompactionAttachments<'a> {
 
 impl RecoveryState {
     pub fn record_file_read(&mut self, path: &str, output: &str) {
-        self.file_reads.insert(path.to_string(), output.to_string());
+        self.file_reads.retain(|record| record.path != path);
+        self.file_reads.push(FileReadRecord {
+            path: path.to_string(),
+            output: output.to_string(),
+        });
+        if self.file_reads.len() > RECENT_FILE_READ_LIMIT {
+            let overflow = self.file_reads.len() - RECENT_FILE_READ_LIMIT;
+            self.file_reads.drain(0..overflow);
+        }
     }
 
     fn attachment(&self, tools: &[ToolDefinition], token_budget: usize) -> String {
@@ -183,8 +200,8 @@ impl RecoveryState {
         let tool_budget = token_budget.saturating_sub(file_budget);
         if !self.file_reads.is_empty() {
             let mut files = String::from("Recently read files:\n");
-            for (path, content) in &self.file_reads {
-                files.push_str(&format!("--- {path} ---\n{content}\n"));
+            for record in self.file_reads.iter().rev() {
+                files.push_str(&format!("--- {} ---\n{}\n", record.path, record.output));
             }
             truncate_to_tokens(&mut files, file_budget);
             attachment.push_str(&files);
@@ -369,7 +386,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
 }
 
 fn approximate_tokens(text: &str) -> usize {
-    (text.chars().count() as f64 / 3.5).ceil() as usize
+    (text.len() as f64 / 3.5).ceil() as usize
 }
 
 fn truncate_to_tokens(text: &mut String, token_budget: usize) {
@@ -413,9 +430,22 @@ fn is_tool_use(block: &ContentBlock) -> bool {
     matches!(block, ContentBlock::ToolUse { .. })
 }
 
-pub(crate) fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_state_keeps_only_the_most_recent_file_reads() {
+        let mut recovery = RecoveryState::default();
+        for index in 0..12 {
+            recovery.record_file_read(&format!("file-{index}"), "content");
+        }
+        recovery.record_file_read("file-2", "updated");
+
+        let attachment = recovery.attachment(&[], 1_000);
+        assert!(attachment.contains("--- file-11 ---"));
+        assert!(attachment.contains("--- file-2 ---\nupdated"));
+        assert!(!attachment.contains("--- file-0 ---"));
+        assert!(!attachment.contains("--- file-1 ---"));
+    }
 }
