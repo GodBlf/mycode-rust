@@ -6,7 +6,8 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::conversation::{ConversationMessage, first_user_text};
+use crate::conversation::{ContentBlock, ConversationMessage, MessageRole, first_user_text};
+use crate::time::current_timestamp;
 use crate::workspace::{WorkspacePaths, unique_slug};
 
 #[derive(Debug, Error)]
@@ -94,6 +95,32 @@ pub struct SessionSummary {
     pub modified_at: SystemTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactBoundary {
+    pub summary: String,
+    pub keep: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SessionRecord {
+    Message(ConversationMessage),
+    CompactBoundary(CompactBoundary),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactBoundaryRecord {
+    #[serde(rename = "type")]
+    record_type: CompactBoundaryRecordKind,
+    #[serde(flatten)]
+    boundary: CompactBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CompactBoundaryRecordKind {
+    CompactBoundary,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     work_dir: PathBuf,
@@ -141,45 +168,144 @@ impl SessionStore {
             })
     }
 
+    pub fn append_compact_boundary(
+        &self,
+        session_id: &SessionId,
+        boundary: &CompactBoundary,
+    ) -> Result<(), SessionError> {
+        let path = self.session_path(session_id);
+        fs::create_dir_all(path.parent().expect("session path has a parent")).map_err(
+            |source| SessionError::CreateDirectory {
+                path: path
+                    .parent()
+                    .expect("session path has a parent")
+                    .to_path_buf(),
+                source,
+            },
+        )?;
+        let record = CompactBoundaryRecord {
+            record_type: CompactBoundaryRecordKind::CompactBoundary,
+            boundary: boundary.clone(),
+        };
+        let record = serde_json::to_string(&record).map_err(|source| SessionError::Serialize {
+            session_id: session_id.as_str().to_string(),
+            source,
+        })?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| SessionError::Append {
+                session_id: session_id.as_str().to_string(),
+                source,
+            })?;
+        file.write_all(record.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|source| SessionError::Append {
+                session_id: session_id.as_str().to_string(),
+                source,
+            })
+    }
+
     pub fn load(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<Vec<ConversationMessage>>, SessionError> {
-        let path = self.session_path(session_id);
-        let file = File::open(&path).map_or_else(
-            |source| {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    Ok(None)
-                } else {
-                    Err(SessionError::Read {
-                        session_id: session_id.as_str().to_string(),
-                        source,
-                    })
-                }
-            },
-            |file| Ok(Some(file)),
-        )?;
+        let file = self.open_session_file_if_exists(session_id)?;
         let Some(file) = file else {
             return Ok(None);
         };
+        let records = self.read_records(session_id, file)?;
+        Ok(Some(Self::resume_messages(records)))
+    }
+
+    pub fn search(&self, query: &str) -> Result<Vec<SessionSummary>, SessionError> {
+        let query = query.to_lowercase();
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|summary| {
+                query.is_empty()
+                    || summary
+                        .first_user_message
+                        .as_deref()
+                        .is_some_and(|message| message.to_lowercase().contains(&query))
+                    || summary.id.as_str().to_lowercase().contains(&query)
+            })
+            .collect())
+    }
+
+    fn read_records(
+        &self,
+        session_id: &SessionId,
+        file: File,
+    ) -> Result<Vec<SessionRecord>, SessionError> {
         let reader = BufReader::new(file);
-        let mut messages = Vec::new();
+        let mut records = Vec::new();
 
         for (index, line) in reader.lines().enumerate() {
             let line = line.map_err(|source| SessionError::Read {
                 session_id: session_id.as_str().to_string(),
                 source,
             })?;
-            let message =
-                serde_json::from_str(&line).map_err(|source| SessionError::InvalidRecord {
+            let value = serde_json::from_str::<serde_json::Value>(&line).map_err(|source| {
+                SessionError::InvalidRecord {
                     session_id: session_id.as_str().to_string(),
                     line_number: index + 1,
                     source,
+                }
+            })?;
+            if value.get("type").and_then(serde_json::Value::as_str) == Some("compact_boundary") {
+                let record = serde_json::from_value::<CompactBoundaryRecord>(value);
+                if let Ok(record) = record {
+                    records.push(SessionRecord::CompactBoundary(record.boundary));
+                }
+                continue;
+            }
+            let message =
+                serde_json::from_value::<ConversationMessage>(value).map_err(|source| {
+                    SessionError::InvalidRecord {
+                        session_id: session_id.as_str().to_string(),
+                        line_number: index + 1,
+                        source,
+                    }
                 })?;
-            messages.push(message);
+            records.push(SessionRecord::Message(message));
         }
 
-        Ok(Some(messages))
+        Ok(records)
+    }
+
+    fn resume_messages(records: Vec<SessionRecord>) -> Vec<ConversationMessage> {
+        let last_boundary = records
+            .iter()
+            .rposition(|record| matches!(record, SessionRecord::CompactBoundary(_)));
+        let Some(index) = last_boundary else {
+            return records
+                .into_iter()
+                .filter_map(SessionRecord::into_message)
+                .collect();
+        };
+
+        let SessionRecord::CompactBoundary(boundary) = &records[index] else {
+            unreachable!("rposition returned a compact boundary");
+        };
+        let summary = ConversationMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: boundary.summary.clone(),
+            }],
+            timestamp_unix_seconds: current_timestamp(),
+        };
+        let mut messages = vec![summary];
+        messages.extend(boundary.keep.iter().cloned());
+        messages.extend(
+            records
+                .into_iter()
+                .skip(index + 1)
+                .filter_map(SessionRecord::into_message),
+        );
+        messages
     }
 
     pub fn list(&self) -> Result<Vec<SessionSummary>, SessionError> {
@@ -206,7 +332,7 @@ impl SessionStore {
                 .and_then(|value| value.to_str())
                 .ok_or(SessionError::InvalidSessionId)?;
             let id = SessionId::new(file_stem)?;
-            let messages = self.load(&id)?.unwrap_or_default();
+            let messages = self.load_message_records(&id)?;
             let metadata = entry.metadata().map_err(|source| SessionError::Metadata {
                 session_id: id.as_str().to_string(),
                 source,
@@ -244,5 +370,43 @@ impl SessionStore {
 
     fn session_path(&self, session_id: &SessionId) -> PathBuf {
         Path::new(&self.sessions_dir()).join(format!("{}.jsonl", session_id.as_str()))
+    }
+
+    fn open_session_file_if_exists(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<File>, SessionError> {
+        match File::open(self.session_path(session_id)) {
+            Ok(file) => Ok(Some(file)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(SessionError::Read {
+                session_id: session_id.as_str().to_string(),
+                source,
+            }),
+        }
+    }
+
+    fn load_message_records(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ConversationMessage>, SessionError> {
+        let file = self.open_session_file_if_exists(session_id)?;
+        let Some(file) = file else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .read_records(session_id, file)?
+            .into_iter()
+            .filter_map(SessionRecord::into_message)
+            .collect())
+    }
+}
+
+impl SessionRecord {
+    fn into_message(self) -> Option<ConversationMessage> {
+        match self {
+            Self::Message(message) => Some(message),
+            Self::CompactBoundary(_) => None,
+        }
     }
 }

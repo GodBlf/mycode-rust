@@ -1,21 +1,31 @@
+use compaction::compact_conversation;
 use mycode_core::conversation::{ContentBlock, Conversation, ConversationMessage, MessageRole};
 use mycode_core::session::{SessionId, SessionStore};
-use mycode_llm::{LlmClient, ProviderError, ProviderEvent, ProviderRequest, ToolDefinition};
+use mycode_core::time::current_timestamp;
+use mycode_llm::{LlmClient, ProviderError, ProviderEvent, ProviderRequest, ToolDefinition, Usage};
 use mycode_tools::context::ToolContext;
 use mycode_tools::runtime::ToolExecutor;
 use std::collections::VecDeque;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use tools::{PendingToolCall, PermissionResponse, authorize_tool, execute_plan};
 
+mod compaction;
 mod config;
 mod events;
+pub mod tool_result;
 mod tools;
 
+pub use compaction::{
+    CompactionConfig, CompactionError, CompactionOutcome, CompactionTracker, CompactionTrigger,
+    RecoveryState, estimate_tokens,
+};
 pub use config::AgentConfig;
 pub use events::AgentEvent;
+pub use tool_result::{ToolResultBudget, ToolResultBudgetConfig, ToolResultBudgetError};
 
 pub struct Agent {
     provider: Box<dyn LlmClient>,
@@ -29,6 +39,17 @@ pub struct Agent {
 pub struct AgentRun {
     pub events: mpsc::Receiver<AgentEvent>,
     permission_sender: mpsc::Sender<PermissionResponse>,
+}
+
+struct ProviderTurn {
+    text: String,
+    tool_calls: Vec<PendingToolCall>,
+    usage: Option<Usage>,
+}
+
+enum ProviderTurnError {
+    Provider(ProviderError),
+    EventStreamClosed,
 }
 
 impl Agent {
@@ -63,6 +84,32 @@ impl Agent {
         }
     }
 
+    pub async fn compact(&self) -> Result<CompactionOutcome, CompactionError> {
+        let messages = self
+            .session_store
+            .load(&self.session_id)?
+            .ok_or(CompactionError::SessionMissing)?;
+        let mut conversation = Conversation::new();
+        for message in messages {
+            conversation.push(message);
+        }
+        compact_conversation(
+            self.provider.as_ref(),
+            compaction::CompactionTarget {
+                session_store: &self.session_store,
+                session_id: &self.session_id,
+            },
+            &conversation,
+            &self.config.compaction,
+            compaction::CompactionAttachments {
+                cancellation: self.context.cancellation().clone(),
+                recovery: None,
+                tools: &[],
+            },
+        )
+        .await
+    }
+
     async fn run_inner(
         self,
         prompt: String,
@@ -77,43 +124,19 @@ impl Agent {
             session_id,
             config,
         } = self;
-        let mut conversation = match session_store.load(&session_id) {
-            Ok(Some(messages)) => {
-                let mut conversation = Conversation::new();
-                for message in messages {
-                    conversation.push(message);
-                }
-                conversation
-            }
-            Ok(None) => Conversation::new(),
-            Err(error) => {
-                let _ = event_sender
-                    .send(AgentEvent::RunError {
-                        message: error.to_string(),
-                    })
-                    .await;
-                return;
-            }
+        let (mut conversation, mut tool_result_budget) = match initialize_run(
+            &session_store,
+            context.workspace_root(),
+            &session_id,
+            &config,
+            prompt,
+            &event_sender,
+        )
+        .await
+        {
+            Ok(run) => run,
+            Err(()) => return,
         };
-
-        conversation.push(ConversationMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text { text: prompt }],
-            timestamp_unix_seconds: current_timestamp(),
-        });
-        let user_message = conversation
-            .messages()
-            .last()
-            .cloned()
-            .expect("user message was just pushed");
-        if let Err(error) = session_store.append(&session_id, &user_message) {
-            let _ = event_sender
-                .send(AgentEvent::RunError {
-                    message: error.to_string(),
-                })
-                .await;
-            return;
-        }
 
         if config.max_iterations == 0 {
             let _ = event_sender
@@ -124,83 +147,80 @@ impl Agent {
             return;
         }
 
-        let tools: Vec<ToolDefinition> = executor
-            .registry()
-            .list()
-            .into_iter()
-            .map(|tool| ToolDefinition {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                parameters: tool
-                    .schema()
-                    .get("input_schema")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
-            })
-            .collect();
+        let tools = tool_definitions(&executor);
+        let mut compaction_tracker = CompactionTracker::default();
+        let mut recovery_state = RecoveryState::default();
         let mut iteration = 0;
         loop {
             iteration += 1;
-            let request = ProviderRequest {
-                system_prompt: config.system_prompt.clone(),
-                conversation: conversation.clone(),
-                tools: tools.clone(),
-            };
-            let mut provider_stream = match provider
-                .stream(request, context.cancellation().clone())
+            let trigger =
+                compaction_tracker.should_compact(conversation.messages(), &config.compaction);
+            if trigger != compaction::CompactionTrigger::None {
+                match compact_conversation(
+                    provider.as_ref(),
+                    compaction::CompactionTarget {
+                        session_store: &session_store,
+                        session_id: &session_id,
+                    },
+                    &conversation,
+                    &config.compaction,
+                    compaction::CompactionAttachments {
+                        cancellation: context.cancellation().clone(),
+                        recovery: Some(&recovery_state),
+                        tools: &tools,
+                    },
+                )
                 .await
-            {
-                Ok(stream) => stream,
-                Err(error) => {
-                    send_provider_error(&event_sender, error).await;
-                    return;
-                }
-            };
-
-            let mut text = String::new();
-            let mut tool_calls: Vec<PendingToolCall> = Vec::new();
-            while let Some(result) = provider_stream.recv().await {
-                match result {
-                    Ok(ProviderEvent::TextDelta { text: delta }) => {
-                        text.push_str(&delta);
-                        if event_sender
-                            .send(AgentEvent::TextDelta { text: delta })
-                            .await
-                            .is_err()
-                        {
+                {
+                    Ok(outcome) if !outcome.summary.is_empty() => {
+                        conversation = outcome.compacted_conversation;
+                        compaction_tracker.reset_after_compaction();
+                        let event = AgentEvent::Compacted {
+                            message: format!(
+                                "Compacted: {} → {} estimated tokens",
+                                outcome.estimated_tokens_before, outcome.estimated_tokens_after
+                            ),
+                        };
+                        if event_sender.send(event).await.is_err() {
                             return;
                         }
                     }
-                    Ok(ProviderEvent::ToolCallComplete {
-                        tool_id,
-                        tool_name,
-                        arguments,
-                    }) => {
-                        tool_calls.push(PendingToolCall {
-                            tool_id: tool_id.clone(),
-                            tool_name: tool_name.clone(),
-                            arguments: arguments.clone(),
-                        });
-                        if event_sender
-                            .send(AgentEvent::ToolCall {
-                                tool_id,
-                                tool_name,
-                                arguments,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(ProviderEvent::StreamEnd { .. }) => break,
-                    Ok(_) => {}
+                    Ok(_) => compaction_tracker.record_auto_success(),
                     Err(error) => {
-                        send_provider_error(&event_sender, error).await;
-                        return;
+                        if trigger == compaction::CompactionTrigger::Hard {
+                            send_run_error(&event_sender, error.to_string()).await;
+                            return;
+                        }
+                        compaction_tracker.record_auto_failure(&config.compaction);
                     }
                 }
             }
+
+            let request = ProviderRequest {
+                system_prompt: config.system_prompt.clone(),
+                conversation: tool_result_budget.apply(&conversation),
+                tools: tools.clone(),
+            };
+            let turn = match stream_provider_turn(
+                provider.as_ref(),
+                request,
+                context.cancellation().clone(),
+                &event_sender,
+            )
+            .await
+            {
+                Ok(turn) => turn,
+                Err(ProviderTurnError::Provider(error)) => {
+                    send_provider_error(&event_sender, error).await;
+                    return;
+                }
+                Err(ProviderTurnError::EventStreamClosed) => return,
+            };
+            let ProviderTurn {
+                text,
+                tool_calls,
+                usage,
+            } = turn;
 
             let mut assistant_content = Vec::new();
             if !text.is_empty() {
@@ -223,6 +243,9 @@ impl Agent {
                 return;
             }
             conversation.push(assistant_message);
+            if let Some(usage) = usage {
+                compaction_tracker.record_usage(usage, conversation.messages().len());
+            }
 
             if tool_calls.is_empty() {
                 let _ = event_sender
@@ -253,6 +276,7 @@ impl Agent {
                     (
                         plan.tool_call.tool_id.clone(),
                         plan.tool_call.tool_name.clone(),
+                        plan.tool_call.arguments.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -291,7 +315,14 @@ impl Agent {
                 let Some(result) = result else {
                     continue;
                 };
-                let (tool_id, tool_name) = tool_metadata[index].clone();
+                let (tool_id, tool_name, arguments) = tool_metadata[index].clone();
+                if tool_name == "ReadFile"
+                    && let Some(path) = arguments
+                        .get("file_path")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    recovery_state.record_file_read(path, &result.output);
+                }
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: tool_id.clone(),
                     content: result.output.clone(),
@@ -357,6 +388,139 @@ impl AgentRun {
     }
 }
 
+async fn initialize_run(
+    session_store: &SessionStore,
+    workspace_root: &std::path::Path,
+    session_id: &SessionId,
+    config: &AgentConfig,
+    prompt: String,
+    event_sender: &mpsc::Sender<AgentEvent>,
+) -> Result<(Conversation, ToolResultBudget), ()> {
+    let mut conversation = match session_store.load(session_id) {
+        Ok(Some(messages)) => conversation_from_messages(messages),
+        Ok(None) => Conversation::new(),
+        Err(error) => {
+            send_run_error(event_sender, error.to_string()).await;
+            return Err(());
+        }
+    };
+    let mut tool_result_budget =
+        match ToolResultBudget::resume(workspace_root, session_id, config.tool_result_budget) {
+            Ok(budget) => budget,
+            Err(error) => {
+                send_run_error(event_sender, error.to_string()).await;
+                return Err(());
+            }
+        };
+    tool_result_budget.reconstruct(&conversation);
+
+    conversation.push(ConversationMessage {
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text { text: prompt }],
+        timestamp_unix_seconds: current_timestamp(),
+    });
+    let user_message = conversation
+        .messages()
+        .last()
+        .cloned()
+        .expect("user message was just pushed");
+    if let Err(error) = session_store.append(session_id, &user_message) {
+        send_run_error(event_sender, error.to_string()).await;
+        return Err(());
+    }
+
+    Ok((conversation, tool_result_budget))
+}
+
+fn conversation_from_messages(messages: Vec<ConversationMessage>) -> Conversation {
+    let mut conversation = Conversation::new();
+    for message in messages {
+        conversation.push(message);
+    }
+    conversation
+}
+
+fn tool_definitions(executor: &ToolExecutor) -> Vec<ToolDefinition> {
+    executor
+        .registry()
+        .list()
+        .into_iter()
+        .map(|tool| ToolDefinition {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            parameters: tool
+                .schema()
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+        })
+        .collect()
+}
+
+async fn stream_provider_turn(
+    provider: &dyn LlmClient,
+    request: ProviderRequest,
+    cancellation: CancellationToken,
+    event_sender: &mpsc::Sender<AgentEvent>,
+) -> Result<ProviderTurn, ProviderTurnError> {
+    let mut provider_stream = provider
+        .stream(request, cancellation)
+        .await
+        .map_err(ProviderTurnError::Provider)?;
+    let mut turn = ProviderTurn {
+        text: String::new(),
+        tool_calls: Vec::new(),
+        usage: None,
+    };
+
+    while let Some(result) = provider_stream.recv().await {
+        match result {
+            Ok(ProviderEvent::TextDelta { text: delta }) => {
+                turn.text.push_str(&delta);
+                if event_sender
+                    .send(AgentEvent::TextDelta { text: delta })
+                    .await
+                    .is_err()
+                {
+                    return Err(ProviderTurnError::EventStreamClosed);
+                }
+            }
+            Ok(ProviderEvent::ToolCallComplete {
+                tool_id,
+                tool_name,
+                arguments,
+            }) => {
+                turn.tool_calls.push(PendingToolCall {
+                    tool_id: tool_id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: arguments.clone(),
+                });
+                if event_sender
+                    .send(AgentEvent::ToolCall {
+                        tool_id,
+                        tool_name,
+                        arguments,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Err(ProviderTurnError::EventStreamClosed);
+                }
+            }
+            Ok(ProviderEvent::StreamEnd {
+                usage: reported, ..
+            }) => {
+                turn.usage = Some(reported);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => return Err(ProviderTurnError::Provider(error)),
+        }
+    }
+
+    Ok(turn)
+}
+
 async fn send_run_error(event_sender: &mpsc::Sender<AgentEvent>, message: String) {
     let _ = event_sender.send(AgentEvent::RunError { message }).await;
 }
@@ -370,11 +534,4 @@ async fn send_provider_error(event_sender: &mpsc::Sender<AgentEvent>, error: Pro
         }
     };
     let _ = event_sender.send(event).await;
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
 }

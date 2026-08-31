@@ -27,6 +27,9 @@ pub enum AgentEvent {
         content: String,
         is_error: bool,
     },
+    Compacted {
+        message: String,
+    },
     RunCompleted {
         final_text: String,
     },
