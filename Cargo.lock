@@ -591,16 +591,22 @@ name = "mycode-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures-util",
+ "home",
  "mycode-core",
  "mycode-llm",
  "mycode-tools",
+ "regex",
+ "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
