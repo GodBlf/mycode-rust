@@ -16,6 +16,7 @@ use tools::{PendingToolCall, PermissionResponse, authorize_tool, execute_plan};
 mod compaction;
 mod config;
 mod events;
+mod prompt;
 pub mod tool_result;
 mod tools;
 
