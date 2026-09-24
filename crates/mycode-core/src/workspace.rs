@@ -39,6 +39,18 @@ impl WorkspacePaths {
         self.work_dir.join(".mycode/plans")
     }
 
+    pub fn skills_dir(&self) -> PathBuf {
+        self.work_dir.join(".mycode/skills")
+    }
+
+    pub fn memory_dir(&self) -> PathBuf {
+        self.work_dir.join(".mycode/memory")
+    }
+
+    pub fn prompt_history_file(&self) -> PathBuf {
+        self.work_dir.join(".mycode/prompt_history.jsonl")
+    }
+
     pub fn file_history_dir(&self) -> PathBuf {
         self.work_dir.join(".mycode/file-history")
     }
